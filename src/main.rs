@@ -24,7 +24,6 @@ struct Backend {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     graphics_queue: wgpu::Queue,
-    // TODO: add present queue?
     config: wgpu::SurfaceConfiguration,
 
     size: winit::dpi::PhysicalSize<u32>,
