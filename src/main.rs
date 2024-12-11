@@ -15,6 +15,7 @@ use wgpu;
 use wgpu::util::DeviceExt;
 use pollster;
 use bytemuck;
+use cgmath::prelude::*;
 
 #[derive(Debug)]
 struct RenderContext {
@@ -140,9 +141,6 @@ impl RenderContext {
         let device = self.get_device_by_id(target.device_id);
         target.surface.configure(&device.device, &target.config);
     }
-
-
-
 }
 
 #[derive(Debug)]
@@ -161,6 +159,15 @@ struct RenderTarget<'s> {
 impl RenderTarget<'_> {
     fn is_live (&self) -> bool {
         return !self.minimized
+    }
+
+    fn get_data (&self) -> TargetData {
+        TargetData{
+            vp_x: 0,
+            vp_y: 0,
+            vp_width: self.config.width,
+            vp_height: self.config.height,
+        }
     }
 }
 
@@ -199,10 +206,78 @@ const VERTICES: &[Vertex] = &[
     Vertex { position: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0, 1.0] },
     Vertex { position: [0.5, -0.5, 0.0], color: [0.0, 0.0, 1.0, 1.0] },
 ];
+
+fn pad_to_copy_buffer_alignment(size: wgpu::BufferAddress) -> wgpu::BufferAddress {
+    let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1; // 0b11 since copy buffer alignment is 4
+    ((size + align_mask) & !align_mask) // round up to nearest aligned
+        .max(wgpu::COPY_BUFFER_ALIGNMENT) // make sure it's non-empty
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    // note even though only really using 2+1D transformations, the alignments on vec3's are a real pain.
+    clip_world_tf: [[f32; 4]; 4], // tf from world coordinates to clip coordinates (for bb purposes)
+    world_frag_tf: [[f32; 4]; 4], // tf from fragment coordinates to world coordinates.
+}
+
+impl Uniforms {
+    fn get(state: &AppState, target_data: &TargetData) -> Self {
+        let clip_frag_tf = // scaled -1 to +1 (clip coords)
+            cgmath::Matrix4::from_translation(cgmath::vec3(-1f32, 1f32, 0f32))
+                * // scaled from 0 to +2 for x and -2 to 0 for y
+            cgmath::Matrix4::from_nonuniform_scale(
+                2f32 / target_data.vp_width as f32,
+                -2f32 / target_data.vp_height as f32,
+                1f32,
+            )
+                * // scaled from 0 to width/height
+            cgmath::Matrix4::from_translation(cgmath::vec3(
+                -target_data.vp_x as f32,
+                -target_data.vp_y as f32,
+                0f32,
+            )); // scaled from vp_x/y to width + vp_x / height + vp_y
+
+        let world_clip_tf = cgmath::Matrix4::from_nonuniform_scale(
+            target_data.vp_width as f32 / target_data.vp_height as f32 * state.scale,
+            state.scale,
+            1f32,
+        );
+
+        Self {
+            clip_world_tf: world_clip_tf.invert().unwrap().into(),
+            world_frag_tf: (world_clip_tf * clip_frag_tf).into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TargetData {
+    vp_x: i32,
+    vp_y: i32,
+    vp_width: u32,
+    vp_height: u32,
+}
+
+#[derive(Debug)]
+struct AppState {
+    scale: f32,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            scale: 1.0f32,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RenderEngine {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
+    uniform_buffer: wgpu::Buffer,
+    uniform_bind_group: wgpu::BindGroup,
 }
 
 // trash man version of !
@@ -230,11 +305,52 @@ impl RenderEngine {
                     source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
                 }
             );
+        let uniform_bind_group_layout = device
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count:None,
+                    }
+                ],
+                label: Some("uniform_bind_group_layout"),
+            });
+        let uniform_buffer = device
+            .device
+            .create_buffer(
+                &wgpu::BufferDescriptor{
+                    label: Some("uniform_buffer"),
+                    size: pad_to_copy_buffer_alignment(size_of::<Uniforms>() as u64),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }
+            );
+        let uniform_bind_group = device
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &uniform_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    }
+                ],
+                label: Some("uniform_bind_group"),
+            });
         let render_pipeline_layout = device
             .device
             .create_pipeline_layout( &wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[
+                    &uniform_bind_group_layout,
+                ],
                 push_constant_ranges: &[],
             });
         let render_pipeline = device
@@ -290,9 +406,15 @@ impl RenderEngine {
         RenderEngine {
             render_pipeline,
             vertex_buffer,
+            uniform_buffer,
+            uniform_bind_group,
         }
     }
-    fn render(&self, device: &DeviceHandle, target_view: &wgpu::TextureView) -> Result<(), Never> {
+    fn render(&self, device: &DeviceHandle,
+              target_view: &wgpu::TextureView,
+              target_data: &TargetData,
+              app_state: &AppState,
+    ) -> Result<()> {
         let mut encoder = device
             .device
             .create_command_encoder(
@@ -308,9 +430,9 @@ impl RenderEngine {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.2,
-                        g: 0.2,
-                        b: 0.2,
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
                         a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
@@ -321,10 +443,21 @@ impl RenderEngine {
             timestamp_writes: None,
         });
         render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.draw(0..3, 0..1);
         drop(render_pass);
 
+        let mut view = device
+            .queue
+            .write_buffer_with(
+                &self.uniform_buffer,
+                0,
+                wgpu::BufferSize::new(size_of::<Uniforms>() as wgpu::BufferAddress).unwrap(),
+            )
+            .ok_or(anyhow!("Could not write to uniforms buffer"))?;
+        view.copy_from_slice(bytemuck::cast_slice(&[Uniforms::get(app_state, target_data)]));
+        drop(view);
         device.queue.submit(std::iter::once(encoder.finish()));
         Ok(())
     }
@@ -353,6 +486,7 @@ struct App<'s> {
     target: Option<RenderTarget<'s>>,
     context: RenderContext,
     engine: Option<RenderEngine>,
+    state: AppState,
 }
 
 impl App<'_> {
@@ -361,6 +495,7 @@ impl App<'_> {
             target: None,
             context: RenderContext::new(),
             engine: None,
+            state: AppState::new(),
         }
 }
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -379,6 +514,8 @@ impl App<'_> {
             self.engine.as_ref().ok_or(anyhow!("Cannot render: engine missing."))?.render(
                 self.context.get_target_device(target),
                 &view,
+                &target.get_data(),
+                &self.state,
             )?;
 
             output.present();
@@ -408,6 +545,20 @@ impl ApplicationHandler for App<'_> {
             }
             WindowEvent::Resized(size) => {
                 self.resize(size);
+            }
+            WindowEvent::KeyboardInput {
+                event: KeyEvent{
+                    state,
+                    physical_key: winit::keyboard::PhysicalKey::Code(keycode),
+                    ..
+                },
+                ..
+            } =>  {
+                match keycode  {
+                    winit::keyboard::KeyCode::KeyQ => { self.state.scale *= 1.1 },
+                    winit::keyboard::KeyCode::KeyE => { self.state.scale *= 0.9 },
+                    _ => {}
+                }
             }
             _ => {}
         }
