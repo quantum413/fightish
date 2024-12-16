@@ -8,24 +8,36 @@ struct Uniforms {
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
+struct Quad {
+    bb: vec4<f32>,
+    color: vec4<f32>,
+    clip_depth: u32, // really only have 24 bits guaranteed
+}
+
+
+@group(1) @binding(0)
+var<storage, read> quads: array<Quad>;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec4<f32>,
+    @location(0) @interpolate(flat) color: vec4<f32>,
 };
-
-struct VertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) color: vec4<f32>,
-}
 
 @vertex
 fn vs_main(
-    model: VertexInput,
+    @builtin(vertex_index) index: u32,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.color = model.color;
-
-    out.clip_position = uniforms.clip_world_tf * vec4(model.position, 1.0);
+    let quad = quads[index/6];
+    let m = index % 6;
+    out.clip_position = uniforms.clip_world_tf * vec4(
+        select(quad.bb.x, quad.bb.z, (m & 1) != 0),
+        select(quad.bb.y, quad.bb.w, m > 1 && m < 5),
+        0.0,
+        1.0,
+    );
+    out.clip_position = vec4(out.clip_position.xy / out.clip_position.w, f32(quad.clip_depth) / 16777216.0 , 1.0);
+    out.color = quad.color;
     return out;
 }
 

@@ -3,19 +3,20 @@ use std::sync::Arc;
 use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
 use winit::event_loop::ActiveEventLoop;
-use log::{info, warn};
 use winit::event::{KeyEvent, WindowEvent};
+use log::{info, warn};
 
 mod scene;
 mod render;
+mod engine;
 
 use scene::SceneData;
 use render::{
     RenderContext,
-    RenderEngine,
     RenderTarget,
     TargetData,
 };
+use engine::{RenderEngine, RenderDongle};
 #[derive(Debug)]
 struct AppState {
     scale: f32,
@@ -61,7 +62,7 @@ impl AppState {
 
 #[derive(Debug)]
 pub struct App<'s> {
-    target: Option<RenderTarget<'s>>,
+    target: Option<RenderTarget<'s, RenderDongle>>,
     context: RenderContext,
     engine: Option<RenderEngine>,
     state: AppState,
@@ -78,19 +79,20 @@ impl App<'_> {
     }
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         self.target.as_mut().map(
-            |t| self.context.resize_surface(t, size)
+            |t| t.resize(&self.context, size)
         );
     }
 
     fn render(&mut self) -> anyhow::Result<()> {
         if let Some(target) = self.target.as_ref() {
             if !target.is_live() { return Ok(()); }
-            let output = target.surface.get_current_texture()?;
+            let output = target.surface().get_current_texture()?;
             let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
             self.engine.as_ref().ok_or(anyhow!("Cannot render: engine missing."))?.render(
-                self.context.get_target_device(target),
+                target.device(&self.context),
                 &view,
+                &target.texture_views(),
                 &self.state.create_scene_data(&target.get_data())
             )?;
             output.present();
@@ -106,8 +108,8 @@ impl ApplicationHandler for App<'_> {
         info!("Window resumed/created, creating window");
         assert!(self.target.is_none(), "Suspending and resuming are not supported.");
         let window = event_loop.create_window(Window::default_attributes()).unwrap();
-        let target = pollster::block_on(self.context.create_target(Arc::new(window))).unwrap();
-        self.engine = Some(RenderEngine::new(&self.context, target.device_id, target.format));
+        let target = pollster::block_on(RenderTarget::create(&mut self.context, Arc::new(window), RenderDongle::new())).unwrap();
+        self.engine = Some(RenderEngine::new(&self.context, target.device_id(), target.surface_format()));
         self.target = Some(target);
     }
 

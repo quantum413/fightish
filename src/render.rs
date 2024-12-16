@@ -2,11 +2,6 @@ use std::sync::Arc;
 use std::ops::Deref;
 use anyhow::anyhow;
 use winit::window::Window;
-use cgmath::SquareMatrix;
-
-use crate::scene::SceneData;
-
-use wgpu::util::DeviceExt;
 
 #[derive(Debug)]
 pub struct RenderContext {
@@ -26,51 +21,8 @@ impl RenderContext {
         }
     }
 
-    pub(crate) async fn create_target<'a, 'b>(&'a mut self, window: Arc<Window>) -> anyhow::Result<RenderTarget<'b>> {
-        let size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return Err(anyhow!("Cannot create zero size window."))
-        }
-        let surface_target: wgpu::SurfaceTarget<'b> = window.clone().into();
-        let surface: wgpu::Surface<'b> = self.instance.create_surface(surface_target)?;
-        let device_id = self.device(Some(&surface)).await.ok_or(anyhow!("No compatible device."))?;
-
-        let surface_caps = surface
-            .get_capabilities(&self.get_device_by_id(device_id).adapter);
-
-        let format = surface_caps.formats.iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
-        // note surface_caps.formats only supposed to be empty when surface and adapter not compatible
-        // so taking first should be ok.
-
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        Ok(RenderTarget {
-            surface,
-            config,
-            format,
-            device_id,
-            window,
-            minimized: false,
-        })
-    }
-
-    fn get_device_by_id(&self, id: DeviceId) -> &DeviceHandle {
+    pub fn get_device_by_id(&self, id: DeviceId) -> &DeviceHandle {
         &self.devices[*id]
-    }
-
-    pub fn get_target_device(&self, target: &RenderTarget) -> &DeviceHandle {
-        self.get_device_by_id(target.device_id)
     }
 
     async fn device(&mut self, compatible_surface: Option<&wgpu::Surface<'_>>) -> Option<DeviceId> {
@@ -117,280 +69,6 @@ impl RenderContext {
         });
         Some(id)
     }
-    pub fn resize_surface(&self, target: &mut RenderTarget, size: winit::dpi::PhysicalSize<u32>) {
-        if size.width > 0 && size.height > 0 {
-            target.config.width = size.width;
-            target.config.height = size.height;
-            target.minimized = false;
-            self.configure_surface(target);
-        } else {
-            target.minimized = true;
-        }
-    }
-
-    fn configure_surface(&self, target: &mut RenderTarget) {
-        let device = self.get_device_by_id(target.device_id);
-        target.surface.configure(&device.device, &target.config);
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 4],
-}
-
-impl Vertex {
-    const ATTRIBS: &'static [wgpu::VertexAttribute; 2] = &[
-        wgpu::VertexAttribute {
-            offset: 0,
-            shader_location: 0,
-            format: wgpu::VertexFormat::Float32x3,
-        },
-        wgpu::VertexAttribute {
-            offset: size_of::<[f32; 3]>() as wgpu::BufferAddress,
-            shader_location: 1,
-            format: wgpu::VertexFormat::Float32x4,
-        }
-    ];
-
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: Self::ATTRIBS,
-        }
-    }
-}
-
-const VERTICES: &[Vertex] = &[
-    Vertex { position: [0.0, 0.5, 0.0], color: [1.0, 0.0, 0.0, 1.0] },
-    Vertex { position: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0, 1.0] },
-    Vertex { position: [0.5, -0.5, 0.0], color: [0.0, 0.0, 1.0, 1.0] },
-];
-
-fn pad_to_copy_buffer_alignment(size: wgpu::BufferAddress) -> wgpu::BufferAddress {
-    let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1; // 0b11 since copy buffer alignment is 4
-    ((size + align_mask) & !align_mask) // round up to nearest aligned
-        .max(wgpu::COPY_BUFFER_ALIGNMENT) // make sure it's non-empty
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    // note even though only really using 2+1D transformations, the alignments on vec3's are a real pain.
-    clip_world_tf: [[f32; 4]; 4], // tf from world coordinates to clip coordinates (for bb purposes)
-    world_frag_tf: [[f32; 4]; 4], // tf from fragment coordinates to world coordinates.
-}
-
-impl Uniforms {
-    fn get(scene_data: &SceneData) -> Self {
-        let clip_frag_tf = // scaled -1 to +1 (clip coords)
-            cgmath::Matrix4::from_translation(cgmath::vec3(-1f32, 1f32, 0f32))
-                * // scaled from 0 to +2 for x and -2 to 0 for y
-                cgmath::Matrix4::from_nonuniform_scale(
-                    2f32 / scene_data.vp_width as f32,
-                    -2f32 / scene_data.vp_height as f32,
-                    1f32,
-                )
-                * // scaled from 0 to width/height
-                cgmath::Matrix4::from_translation(cgmath::vec3(
-                    -scene_data.vp_x as f32,
-                    -scene_data.vp_y as f32,
-                    0f32,
-                )); // scaled from vp_x/y to width + vp_x / height + vp_y
-
-        let world_clip_tf = cgmath::Matrix4::from_nonuniform_scale(
-            scene_data.vp_width as f32 / scene_data.vp_height as f32 * scene_data.camera_scale,
-            scene_data.camera_scale,
-            1f32,
-        );
-
-        Self {
-            clip_world_tf: world_clip_tf.invert().unwrap().into(),
-            world_frag_tf: (world_clip_tf * clip_frag_tf).into(),
-        }
-    }
-}
-
-
-#[derive(Debug)]
-pub struct RenderEngine {
-    render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
-}
-
-impl RenderEngine {
-    pub fn new(context: &RenderContext, device_id: DeviceId, format: wgpu::TextureFormat) -> RenderEngine {
-        let device = context.get_device_by_id(device_id);
-        let shader = device
-            .device
-            .create_shader_module(
-                wgpu::ShaderModuleDescriptor {
-                    label: Some("Shader"),
-                    source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-                }
-            );
-        let uniform_bind_group_layout = device
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    }
-                ],
-                label: Some("uniform_bind_group_layout"),
-            });
-        let uniform_buffer = device
-            .device
-            .create_buffer(
-                &wgpu::BufferDescriptor {
-                    label: Some("uniform_buffer"),
-                    size: pad_to_copy_buffer_alignment(size_of::<Uniforms>() as u64),
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }
-            );
-        let uniform_bind_group = device
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &uniform_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
-                    }
-                ],
-                label: Some("uniform_bind_group"),
-            });
-        let render_pipeline_layout = device
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[
-                    &uniform_bind_group_layout,
-                ],
-                push_constant_ranges: &[],
-            });
-        let render_pipeline = device
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Render Pipeline"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_main", // name of the main function of the vertex shader
-                    buffers: &[
-                        Vertex::desc(),
-                    ],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-                cache: None,
-            });
-
-        let vertex_buffer = device.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(VERTICES),
-                usage: wgpu::BufferUsages::VERTEX,
-            }
-        );
-
-        RenderEngine {
-            render_pipeline,
-            vertex_buffer,
-            uniform_buffer,
-            uniform_bind_group,
-        }
-    }
-    pub(crate) fn render(&self, device: &DeviceHandle,
-                         target_view: &wgpu::TextureView,
-                         scene_data: &SceneData,
-    ) -> anyhow::Result<()> {
-        let mut encoder = device
-            .device
-            .create_command_encoder(
-                &wgpu::CommandEncoderDescriptor {
-                    label: Some("Render Encoder"),
-                }
-            );
-
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 1.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            occlusion_query_set: None,
-            timestamp_writes: None,
-        });
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        render_pass.draw(0..3, 0..1);
-        drop(render_pass);
-
-        let mut view = device
-            .queue
-            .write_buffer_with(
-                &self.uniform_buffer,
-                0,
-                wgpu::BufferSize::new(size_of::<Uniforms>() as wgpu::BufferAddress).unwrap(),
-            )
-            .ok_or(anyhow!("Could not write to uniforms buffer"))?;
-        view.copy_from_slice(bytemuck::cast_slice(
-            &[Uniforms::get(scene_data)]
-        ));
-        drop(view);
-        device.queue.submit(std::iter::once(encoder.finish()));
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,19 +90,24 @@ pub struct DeviceHandle {
 }
 
 #[derive(Debug)]
-pub struct RenderTarget<'s> {
+pub struct RenderTarget<'s, D: TargetTextureDongle> {
     // window must be dropped after surface
-    pub surface: wgpu::Surface<'s>,
+    surface: wgpu::Surface<'s>,
     config: wgpu::SurfaceConfiguration,
-    pub(crate) format: wgpu::TextureFormat,
+    format: wgpu::TextureFormat,
 
     minimized: bool,
-    pub(crate) device_id: DeviceId,
+    device_id: DeviceId,
 
     window: Arc<Window>,
+
+    texture_handler: TargetTextureHandler<D>
 }
 
-impl RenderTarget<'_> {
+impl<D: TargetTextureDongle> RenderTarget<'_, D> {
+    pub fn surface(&self) -> &wgpu::Surface<'_> { &self.surface }
+    pub fn surface_format(&self) -> &wgpu::TextureFormat { &self.format }
+    pub fn device_id(&self) -> DeviceId { self.device_id }
     pub fn is_live(&self) -> bool {
         return !self.minimized
     }
@@ -441,6 +124,132 @@ impl RenderTarget<'_> {
     pub fn window(&self) -> &Window {
         self.window.as_ref()
     }
+
+    pub fn device<'a>(&self, context: &'a RenderContext) -> &'a DeviceHandle {
+        context.get_device_by_id(self.device_id)
+    }
+
+    pub async fn create<'a, 'b> (context: &'a mut RenderContext, window: Arc<Window>, dongle: D) -> anyhow::Result<RenderTarget<'b, D>> {
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return Err(anyhow!("Cannot create zero size window."))
+        }
+        let surface_target: wgpu::SurfaceTarget<'b> = window.clone().into();
+        let surface: wgpu::Surface<'b> = context.instance.create_surface(surface_target)?;
+        let device_id = context.device(Some(&surface)).await.ok_or(anyhow!("No compatible device."))?;
+
+        let surface_caps = surface
+            .get_capabilities(&context.get_device_by_id(device_id).adapter);
+
+        let format = surface_caps.formats.iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(surface_caps.formats[0]);
+        // note surface_caps.formats only supposed to be empty when surface and adapter not compatible
+        // so taking first should be ok.
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width,
+            height: size.height,
+            present_mode: surface_caps.present_modes[0],
+            alpha_mode: surface_caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+
+        Ok(RenderTarget {
+            surface,
+            config,
+            format,
+            device_id,
+            window,
+            minimized: false,
+            texture_handler: TargetTextureHandler::new(
+                context, dongle, device_id, size.width, size.height
+            ),
+        })
+    }
+
+    pub fn resize(&mut self, context: &RenderContext, size: winit::dpi::PhysicalSize<u32>) {
+        if size.width > 0 && size.height > 0 {
+            self.config.width = size.width;
+            self.config.height = size.height;
+            self.minimized = false;
+            self.configure(context);
+            self.texture_handler.refresh(context, self.device_id, size.width, size.height);
+        } else {
+            self.minimized = true;
+        }
+    }
+
+    fn configure(&mut self, context: &RenderContext) {
+        let device = self.device(context);
+        self.surface.configure(&device.device, &self.config);
+    }
+
+    pub fn texture_views(&self) -> &Vec<wgpu::TextureView> {
+        self.texture_handler.views()
+    }
+}
+
+#[derive(Debug)]
+struct TargetTextureHandler<D: TargetTextureDongle> {
+    textures: Vec<wgpu::Texture>,
+    views: Vec<wgpu::TextureView>,
+    dongle: D,
+}
+
+impl<D: TargetTextureDongle> TargetTextureHandler<D> {
+    pub fn new(context: &RenderContext, dongle: D, device_id: DeviceId, width: u32, height: u32) -> Self {
+        let mut this = Self {
+            textures: Vec::new(),
+            views: Vec::new(),
+            dongle,
+        };
+        this.refresh(context, device_id, width, height);
+        this
+    }
+
+    pub fn refresh(&mut self, context: &RenderContext, device_id: DeviceId, width: u32, height: u32) {
+        // Trying to drop the old textures first
+        self.views = Vec::new();
+        self.textures = Vec::new();
+
+        self.textures = (0 .. self.dongle.num_textures())
+            .map(|i|
+                context
+                    .get_device_by_id(device_id)
+                    .device
+                    .create_texture(&self.dongle.texture_desc(i, width, height))
+            )
+            .collect();
+        self.views = (0 .. self.dongle.num_views())
+            .map(|i|
+                self
+                    .textures[self.dongle.view_index(i)]
+                    .create_view(&self.dongle.view_desc(i))
+            )
+            .collect();
+    }
+
+    pub fn views(&self) -> &Vec<wgpu::TextureView> { &self.views }
+
+}
+
+pub trait TargetTextureDongle {
+    fn num_textures(&self) -> usize;
+
+    fn num_views(&self) -> usize { self.num_textures() }
+
+    fn texture_desc(&self, index: usize, width: u32, height: u32) -> wgpu::TextureDescriptor;
+
+    /// The texture index associated with a given view.
+    fn view_index(&self, index: usize) -> usize { index }
+
+    #[allow(unused_variables)]
+    fn view_desc(&self, index: usize) -> wgpu::TextureViewDescriptor { wgpu::TextureViewDescriptor::default() }
 }
 
 #[derive(Debug)]
