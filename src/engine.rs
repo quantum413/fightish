@@ -10,16 +10,52 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 struct Quad {
     bb: [f32; 4],
     color: [f32; 4],
+    segment_index_range: [i32; 2],
     clip_depth: u32,
-    padding: [f32; 3],
+    padding: u32,
 }
 
 const QUADS: &[Quad] = &[
-    Quad {bb: [-1.0f32, -1.0f32, 1.0f32, 1.0f32], color: [1.0, 0.0, 0.0, 1.0], clip_depth: 1, padding: [0f32; 3]},
-    Quad {bb: [0.2f32, 0.7f32, 1.3f32, 1.5f32], color: [0.0, 0.0, 1.0, 1.0], clip_depth: 0, padding: [0f32; 3]},
+    Quad {bb: [-1.0f32, -1.0f32, 1.0f32, 1.0f32], color: [1.0, 0.0, 1.0, 1.0], clip_depth: 1, padding: 0, segment_index_range: [0, 4]},
+    Quad {bb: [-0.2f32, 0.2f32, 1.3f32, 1.5f32], color: [1.0, 0.0, 1.0, 1.0], clip_depth: 2, padding: 0, segment_index_range: [4, 7]},
 ];
 
 const QUAD_BUFFER_SIZE: u32 = 10;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    pos: [f32; 2]
+}
+
+const VERTICES: &[Vertex] = &[
+    Vertex {pos: [ 0.5, 0.0]},
+    Vertex {pos: [ 0.0, 1.0]},
+    Vertex {pos: [-0.5, 0.0]},
+    Vertex {pos: [ 0.0,-0.5]},
+    Vertex {pos: [ 0.7, 1.0]},
+];
+
+const VERT_BUFFER_SIZE: u32 = 15;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Segment {
+    idx: [i32; 4] // making this signed in case using negative values for special cases later
+}
+
+const SEGMENTS: &[Segment] = &[
+    Segment {idx: [0, 2, -1, -1]},
+    Segment {idx: [2, 3, -1, -1]},
+    Segment {idx: [3, 1, -1, -1]},
+    Segment {idx: [1, 0, -1, -1]},
+
+    Segment {idx: [0, 1, -1, -1]},
+    Segment {idx: [1, 4, -1, -1]},
+    Segment {idx: [4, 0, -1, -1]},
+];
+
+const SEGMENT_BUFFER_SIZE: u32 = 20;
 
 fn pad_to_copy_buffer_alignment(size: wgpu::BufferAddress) -> wgpu::BufferAddress {
     let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1; // 0b11 since copy buffer alignment is 4
@@ -101,6 +137,9 @@ pub struct RenderEngine {
     uniform_bind_group: wgpu::BindGroup,
     quad_bind_group: wgpu::BindGroup,
     quad_buffer: wgpu::Buffer,
+    vertex_buffer: wgpu::Buffer,
+    segment_buffer: wgpu::Buffer,
+    vert_bind_group: wgpu::BindGroup,
 }
 
 impl RenderEngine {
@@ -150,6 +189,33 @@ impl RenderEngine {
                     }
                 ],
             });
+        let vert_bind_group_layout = device
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("vertices and indices bind group"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }
+                ]
+            });
         let render_pipeline_layout = device
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -157,6 +223,7 @@ impl RenderEngine {
                 bind_group_layouts: &[
                     &uniform_bind_group_layout,
                     &quad_bind_group_layout,
+                    &vert_bind_group_layout,
                 ],
                 push_constant_ranges: &[],
             });
@@ -245,12 +312,70 @@ impl RenderEngine {
                     resource: quad_buffer.as_entire_binding(),
                 }]
             });
+        let vertex_buffer = device
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vertex buffer"),
+                size: pad_to_copy_buffer_alignment(size_of::<Vertex>() as u64) * VERT_BUFFER_SIZE as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+        let segment_buffer = device
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("segment buffer"),
+                size: pad_to_copy_buffer_alignment(size_of::<Segment>() as u64) * SEGMENT_BUFFER_SIZE as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+        device
+            .queue
+            .write_buffer_with(
+                &vertex_buffer,
+                0,
+                wgpu::BufferSize::new((size_of::<Vertex>() * VERTICES.len()) as u64).unwrap(),
+            )
+            .unwrap()// eventually will move this to loading code, can handle errors after that
+            .copy_from_slice(bytemuck::cast_slice(VERTICES));
+
+        device
+            .queue
+            .write_buffer_with(
+                &segment_buffer,
+                0,
+                wgpu::BufferSize::new((size_of::<Segment>() * SEGMENTS.len()) as u64).unwrap(),
+            )
+            .unwrap()
+            .copy_from_slice(bytemuck::cast_slice(SEGMENTS));
+
+        let vert_bind_group = device
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor{
+                label: Some("vertex and segment bind group"),
+                layout: &vert_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry{
+                        binding: 0,
+                        resource: vertex_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry{
+                        binding: 1,
+                        resource: segment_buffer.as_entire_binding(),
+                    },
+                ]
+            });
+
         RenderEngine {
             render_pipeline,
             uniform_buffer,
             uniform_bind_group,
             quad_bind_group,
             quad_buffer,
+            vertex_buffer,
+            segment_buffer,
+            vert_bind_group,
         }
     }
     pub fn render(&self, device: &DeviceHandle,
@@ -303,6 +428,7 @@ impl RenderEngine {
         render_pass.set_pipeline(&self.render_pipeline);
         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         render_pass.set_bind_group(1, &self.quad_bind_group, &[]);
+        render_pass.set_bind_group(2, &self.vert_bind_group, &[]);
         render_pass.draw(0..(QUADS.len() * 6) as u32, 0..1);
         drop(render_pass);
 
