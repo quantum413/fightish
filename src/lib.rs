@@ -20,23 +20,40 @@ use engine::{RenderEngine, RenderDongle};
 #[derive(Debug)]
 struct AppState {
     scale: f32,
+    pos: cgmath::Vector2<f32>,
+    rot: f32,
 }
 
 impl AppState {
     fn new() -> Self {
         Self {
             scale: 1.0f32,
+            pos: cgmath::Zero::zero(),
+            rot: 0.0,
         }
     }
 
     fn create_scene_data(&self, target_data: &TargetData) -> SceneData {
+        let camera_tf = // world
+            cgmath::Matrix4::from_translation(
+                cgmath::Vector3::new(self.pos.x, self.pos.y, 0.0)
+            )
+            * // scaled, untranslated
+            cgmath::Matrix4::from_nonuniform_scale(
+                target_data.vp_width as f32 / target_data.vp_height as f32 * self.scale,
+                self.scale,
+                1f32,
+            ); // clip coords
+        let object_tf = cgmath::Matrix4::from_angle_z(cgmath::Rad(self.rot));
         SceneData {
             vp_x: target_data.vp_x,
             vp_y: target_data.vp_y,
             vp_width: target_data.vp_width,
             vp_height: target_data.vp_height,
 
-            camera_scale: self.scale,
+            camera_tf,
+
+            objects: vec![scene::Object{world_local_tf: object_tf, model_id: 0}]
         }
     }
 
@@ -52,6 +69,12 @@ impl AppState {
                 match keycode {
                     winit::keyboard::KeyCode::KeyQ => { self.scale *= 1.1 },
                     winit::keyboard::KeyCode::KeyE => { self.scale *= 0.9 },
+                    winit::keyboard::KeyCode::KeyW => { self.pos.y += self.scale * 0.1 },
+                    winit::keyboard::KeyCode::KeyA => { self.pos.x -= self.scale * 0.1 },
+                    winit::keyboard::KeyCode::KeyS => { self.pos.y -= self.scale * 0.1 },
+                    winit::keyboard::KeyCode::KeyD => { self.pos.x += self.scale * 0.1 },
+                    winit::keyboard::KeyCode::KeyZ => { self.rot += 0.1 },
+                    winit::keyboard::KeyCode::KeyC => { self.rot -= 0.1 },
                     _ => {}
                 }
             }

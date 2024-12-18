@@ -1,67 +1,11 @@
-use anyhow::anyhow;
+use std::num::NonZeroU64;
+use anyhow::{anyhow, Result};
 use cgmath::SquareMatrix;
-use crate::render::{DeviceHandle, DeviceId, RenderContext, TargetTextureDongle};
-use crate::scene::SceneData;
+use crate::render::{DeviceHandle, DeviceId, RenderContext, TargetTextureDongle, LayoutEnum};
+use crate::scene::{SceneData, Shard};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Quad {
-    bb: [f32; 4],
-    color: [f32; 4],
-    segment_index_range: [i32; 2],
-    clip_depth: u32,
-    padding: u32,
-}
-
-const QUADS: &[Quad] = &[
-    Quad {bb: [-1.0f32, -1.0f32, 1.0f32, 1.0f32], color: [1.0, 0.0, 1.0, 1.0], clip_depth: 1, padding: 0, segment_index_range: [0, 4]},
-    Quad {bb: [-0.2f32, 0.2f32, 1.3f32, 1.5f32], color: [1.0, 0.0, 1.0, 1.0], clip_depth: 2, padding: 0, segment_index_range: [4, 7]},
-];
-
-const QUAD_BUFFER_SIZE: u32 = 10;
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    pos: [f32; 2]
-}
-
-const VERTICES: &[Vertex] = &[
-    Vertex {pos: [ 0.5, 0.0]},
-    Vertex {pos: [ 0.0, 1.0]},
-    Vertex {pos: [-0.5, 0.0]},
-    Vertex {pos: [ 0.0,-0.5]},
-    Vertex {pos: [ 0.7, 1.0]},
-];
-
-const VERT_BUFFER_SIZE: u32 = 15;
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Segment {
-    idx: [i32; 4] // making this signed in case using negative values for special cases later
-}
-
-const SEGMENTS: &[Segment] = &[
-    Segment {idx: [0, 2, -1, -1]},
-    Segment {idx: [2, 3, -1, -1]},
-    Segment {idx: [3, 1, -1, -1]},
-    Segment {idx: [1, 0, -1, -1]},
-
-    Segment {idx: [0, 1, -1, -1]},
-    Segment {idx: [1, 4, -1, -1]},
-    Segment {idx: [4, 0, -1, -1]},
-];
-
-const SEGMENT_BUFFER_SIZE: u32 = 20;
-
-fn pad_to_copy_buffer_alignment(size: wgpu::BufferAddress) -> wgpu::BufferAddress {
-    let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1; // 0b11 since copy buffer alignment is 4
-    ((size + align_mask) & !align_mask) // round up to nearest aligned
-        .max(wgpu::COPY_BUFFER_ALIGNMENT) // make sure it's non-empty
-}
+const ORIGIN_BUFFER_SIZE: u32 = 5;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -88,11 +32,7 @@ impl Uniforms {
                     0f32,
                 )); // scaled from vp_x/y to width + vp_x / height + vp_y
 
-        let world_clip_tf = cgmath::Matrix4::from_nonuniform_scale(
-            scene_data.vp_width as f32 / scene_data.vp_height as f32 * scene_data.camera_scale,
-            scene_data.camera_scale,
-            1f32,
-        );
+        let world_clip_tf = scene_data.camera_tf;
 
         Self {
             clip_world_tf: world_clip_tf.invert().unwrap().into(),
@@ -100,40 +40,74 @@ impl Uniforms {
         }
     }
 }
-
-#[derive(Debug)]
-pub struct RenderDongle ();
-impl RenderDongle {
-    pub fn new() -> Self {Self ()}
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Origin {
+    world_tex_tf: [[f32; 4]; 4]
 }
 
-impl TargetTextureDongle for RenderDongle {
-    fn num_textures(&self) -> usize { 1 }
-
-    fn texture_desc(&self, _index: usize, width: u32, height: u32) -> wgpu::TextureDescriptor {
-        let depth_size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-        wgpu::TextureDescriptor {
-            label: Some("Depth buffer"),
-            size: depth_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }
-    }
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Quad {
+    bb: [f32; 4],
+    color: [f32; 4],
+    segment_index_range: [i32; 2],
+    clip_depth: u32,
+    origin_index: u32,
 }
+
+const QUAD_BUFFER_SIZE: u32 = 10;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    pos: [f32; 2]
+}
+
+const VERTICES: &[Vertex] = &[
+    Vertex {pos: [ 0.0, 0.0]},
+    Vertex {pos: [ 0.5, 1.0]},
+    Vertex {pos: [-0.5, 0.5]},
+    Vertex {pos: [ 0.0,-0.5]},
+    Vertex {pos: [ 0.2, 1.0]},
+];
+
+const VERT_BUFFER_SIZE: u32 = 15;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Segment {
+    idx: [i32; 4] // making this signed in case using negative values for special cases later
+}
+
+const SEGMENTS: &[Segment] = &[
+    Segment {idx: [0, 2, -1, -1]},
+    Segment {idx: [2, 0, 3, -1]},
+    Segment {idx: [3, 1, -1, -1]},
+    Segment {idx: [1, 0, -1, -1]},
+
+    Segment {idx: [0, 1, -1, -1]},
+    Segment {idx: [1, 4, -1, -1]},
+    Segment {idx: [4, 0, -1, -1]},
+];
+
+const SEGMENT_INDEX_RANGES: &[[i32; 2]] = &[[0, 4], [4, 7]];
+
+const SEGMENT_BUFFER_SIZE: u32 = 20;
+
+fn pad_to_copy_buffer_alignment(size: wgpu::BufferAddress) -> wgpu::BufferAddress {
+    let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1; // 0b11 since copy buffer alignment is 4
+    ((size + align_mask) & !align_mask) // round up to nearest aligned
+        .max(wgpu::COPY_BUFFER_ALIGNMENT) // make sure it's non-empty
+}
+
+
 
 #[derive(Debug)]
 pub struct RenderEngine {
     render_pipeline: wgpu::RenderPipeline,
-    uniform_buffer: wgpu::Buffer,
+    world_uniforms_buffer: wgpu::Buffer,
+    origin_uniforms_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     quad_bind_group: wgpu::BindGroup,
     quad_buffer: wgpu::Buffer,
@@ -153,69 +127,14 @@ impl RenderEngine {
                     source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
                 }
             );
+
+
         let uniform_bind_group_layout = device
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    }
-                ],
-                label: Some("uniform_bind_group_layout"),
-            });
+            .create_bind_group_layout::<UniformGroup>(Some("Uniform bind group layout"));
         let quad_bind_group_layout = device
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("quad bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage {
-                                read_only: true,
-                            },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    }
-                ],
-            });
+            .create_bind_group_layout::<QuadGroup>(Some("Quad bind group layout"));
         let vert_bind_group_layout = device
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("vertices and indices bind group"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    }
-                ]
-            });
+            .create_bind_group_layout::<VertexGroup>(Some("Vertex bind group layout"));
         let render_pipeline_layout = device
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -227,6 +146,8 @@ impl RenderEngine {
                 ],
                 push_constant_ranges: &[],
             });
+
+
         let render_pipeline = device
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -272,63 +193,47 @@ impl RenderEngine {
                 multiview: None,
                 cache: None,
             });
-        let uniform_buffer = device
-            .device
-            .create_buffer(
-                &wgpu::BufferDescriptor {
-                    label: Some("uniform_buffer"),
-                    size: pad_to_copy_buffer_alignment(size_of::<Uniforms>() as u64),
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
+
+
+        let world_uniforms_buffer = device
+            .create_buffer_with_layout_enum(&UniformGroup::WORLD, 1);
+        let origin_uniforms_buffer = device
+            .create_buffer_with_layout_enum(&UniformGroup::ORIGIN, ORIGIN_BUFFER_SIZE as u64);
+        let uniform_bind_group = device
+            .create_bind_group_with_enum_layout_map(
+                &uniform_bind_group_layout,
+                Some("Uniform bind group"),
+                |t| match t {
+                    UniformGroup::WORLD => world_uniforms_buffer.as_entire_binding(),
+                    UniformGroup::ORIGIN => origin_uniforms_buffer.as_entire_binding(),
                 }
             );
-        let uniform_bind_group = device
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &uniform_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
-                    }
-                ],
-                label: Some("uniform_bind_group"),
-            });
-        let quad_buffer = device
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("quad buffer"),
-                size: pad_to_copy_buffer_alignment(size_of::<Quad>() as u64) * QUAD_BUFFER_SIZE as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        let quad_bind_group = device
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor{
-                label: Some("quad bind group"),
-                layout: &quad_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry{
-                    binding: 0,
-                    resource: quad_buffer.as_entire_binding(),
-                }]
-            });
-        let vertex_buffer = device
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("vertex buffer"),
-                size: pad_to_copy_buffer_alignment(size_of::<Vertex>() as u64) * VERT_BUFFER_SIZE as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
 
+        let quad_buffer = device
+            .create_buffer_with_layout_enum(&QuadGroup::QUADS, QUAD_BUFFER_SIZE as u64);
+        let quad_bind_group = device
+            .create_bind_group_with_enum_layout_map(
+                &quad_bind_group_layout,
+                Some("Quad bind group"),
+                |t| match t {
+                    QuadGroup::QUADS => quad_buffer.as_entire_binding(),
+                }
+            );
+
+        let vertex_buffer = device
+            .create_buffer_with_layout_enum(&VertexGroup::VERTEX, VERT_BUFFER_SIZE as u64);
         let segment_buffer = device
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("segment buffer"),
-                size: pad_to_copy_buffer_alignment(size_of::<Segment>() as u64) * SEGMENT_BUFFER_SIZE as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            .create_buffer_with_layout_enum(&VertexGroup::SEGMENT, SEGMENT_BUFFER_SIZE as u64);
+
+        let vert_bind_group = device
+            .create_bind_group_with_enum_layout_map(
+                &vert_bind_group_layout,
+                Some("Vertex bind group"),
+                |t| match t {
+                    VertexGroup::VERTEX => vertex_buffer.as_entire_binding(),
+                    VertexGroup::SEGMENT => segment_buffer.as_entire_binding(),
+                }
+            );
 
         device
             .queue
@@ -350,26 +255,11 @@ impl RenderEngine {
             .unwrap()
             .copy_from_slice(bytemuck::cast_slice(SEGMENTS));
 
-        let vert_bind_group = device
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor{
-                label: Some("vertex and segment bind group"),
-                layout: &vert_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry{
-                        binding: 0,
-                        resource: vertex_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry{
-                        binding: 1,
-                        resource: segment_buffer.as_entire_binding(),
-                    },
-                ]
-            });
 
         RenderEngine {
             render_pipeline,
-            uniform_buffer,
+            world_uniforms_buffer,
+            origin_uniforms_buffer,
             uniform_bind_group,
             quad_bind_group,
             quad_buffer,
@@ -382,7 +272,17 @@ impl RenderEngine {
                          target_surface_view: &wgpu::TextureView,
                          target_texture_views: &Vec<wgpu::TextureView>,
                          scene_data: &SceneData,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
+        if scene_data.objects.len() >= ORIGIN_BUFFER_SIZE as usize {
+            return Err(anyhow!("Number of shards exceeds buffer size."));
+        }
+
+        let shards: Vec<Shard> = self.get_shards(scene_data);
+
+        if shards.len() >= QUAD_BUFFER_SIZE as usize {
+            return Err(anyhow!("Number of shards exceeds buffer size."));
+        }
+
         let mut encoder = device
             .device
             .create_command_encoder(
@@ -391,13 +291,58 @@ impl RenderEngine {
                 }
             );
 
-        device.queue.write_buffer_with(
+        let mut view = device.queue.write_buffer_with(
             &self.quad_buffer,
             0,
-            wgpu::BufferSize::new((size_of::<Quad>() * QUADS.len()) as u64).unwrap(),
+            wgpu::BufferSize::new(QuadGroup::QUADS.size() * shards.len() as u64).unwrap(),
         )
-            .ok_or(anyhow!("Unable to get quad buffer view"))?
-            .copy_from_slice(bytemuck::cast_slice(QUADS));
+            .ok_or(anyhow!("Unable to get quad buffer view"))?;
+        shards
+            .iter()
+            .enumerate()
+            .for_each(|(i, e)| {
+                bytemuck::cast_slice_mut(&mut *view)[i] = Quad {
+                    bb: e.tex_bb.into(),
+                    color: e.color.into(),
+                    segment_index_range: SEGMENT_INDEX_RANGES[e.tex_id],
+                    clip_depth: e.clip_depth,
+                    origin_index: e.origin_index as u32,
+                }
+            });
+        drop(view);
+
+        let mut view = device
+            .queue
+            .write_buffer_with(
+                &self.world_uniforms_buffer,
+                0,
+                wgpu::BufferSize::new(UniformGroup::WORLD.size()).unwrap(),
+            )
+            .ok_or(anyhow!("Could not write to world uniforms buffer"))?;
+        view.copy_from_slice(bytemuck::cast_slice(
+            &[Uniforms::get(scene_data)]
+        ));
+        drop(view);
+
+        let mut view = device
+            .queue
+            .write_buffer_with(
+                &self.origin_uniforms_buffer,
+                0,
+                wgpu::BufferSize::new(
+                    UniformGroup::ORIGIN.size() * scene_data.objects.len() as u64
+                ).unwrap()
+            ).ok_or(anyhow!("Could not write to origin uniform buffer"))?;
+        scene_data
+            .objects
+            .iter()
+            .enumerate()
+            .for_each(|(i, o)|
+                bytemuck::cast_slice_mut(&mut *view)[i] = Origin {
+                    world_tex_tf: o.world_local_tf.into(),
+                }
+            );
+        drop(view);
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
@@ -429,22 +374,231 @@ impl RenderEngine {
         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         render_pass.set_bind_group(1, &self.quad_bind_group, &[]);
         render_pass.set_bind_group(2, &self.vert_bind_group, &[]);
-        render_pass.draw(0..(QUADS.len() * 6) as u32, 0..1);
+        render_pass.draw(0..(shards.len() * 6) as u32, 0..1);
         drop(render_pass);
 
-        let mut view = device
-            .queue
-            .write_buffer_with(
-                &self.uniform_buffer,
-                0,
-                wgpu::BufferSize::new(size_of::<Uniforms>() as wgpu::BufferAddress).unwrap(),
-            )
-            .ok_or(anyhow!("Could not write to uniforms buffer"))?;
-        view.copy_from_slice(bytemuck::cast_slice(
-            &[Uniforms::get(scene_data)]
-        ));
-        drop(view);
         device.queue.submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+
+    fn get_shards(&self, scene_data: &SceneData) -> Vec<Shard> {
+        scene_data
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(i, _)| [
+                Shard {
+                    tex_bb: cgmath::Vector4::new(-1.0f32, -1.0f32, 1.0f32, 1.0f32),
+                    color: cgmath::Vector4::new(1.0, 0.0, 0.0, 1.0),
+                    clip_depth: 1,
+                    tex_id: 0,
+                    origin_index: i,
+                },
+                Shard {
+                    tex_bb: cgmath::Vector4::new(-0.2f32, 0.2f32, 1.3f32, 1.5f32),
+                    color: cgmath::Vector4::new(0.0, 0.0, 1.0, 1.0),
+                    clip_depth: 2,
+                    tex_id: 1,
+                    origin_index: i,
+                },
+            ])
+            .flatten()
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+pub struct RenderDongle ();
+impl RenderDongle {
+    pub fn new() -> Self {Self ()}
+}
+impl TargetTextureDongle for RenderDongle {
+    fn num_textures(&self) -> usize { 1 }
+
+    fn texture_desc(&self, _index: usize, width: u32, height: u32) -> wgpu::TextureDescriptor {
+        let depth_size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        wgpu::TextureDescriptor {
+            label: Some("Depth buffer"),
+            size: depth_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }
+    }
+}
+
+fn create_bind_group_layout_entry_buffer<T: LayoutEnum>(
+    this: &T,
+    visibility: wgpu::ShaderStages,
+    ty: wgpu::BufferBindingType,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding: this.binding(),
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty,
+            has_dynamic_offset: false,
+            min_binding_size: NonZeroU64::new(this.size()),
+        },
+        count: None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UniformGroup {
+    WORLD,
+    ORIGIN,
+}
+
+impl LayoutEnum for UniformGroup {
+    type Iter = <[Self; 2] as IntoIterator>::IntoIter;
+    fn entry_iter() -> Self::Iter {
+        [Self::WORLD, Self::ORIGIN].into_iter()
+    }
+    fn size(&self) -> u64 {
+        pad_to_copy_buffer_alignment(match self {
+            Self::WORLD => size_of::<Uniforms>() as u64,
+            Self::ORIGIN => size_of::<Origin>() as u64,
+        })
+    }
+    fn binding(&self) -> u32 {
+        match self {
+            Self::WORLD => 0,
+            Self::ORIGIN => 1,
+        }
+    }
+
+    fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry {
+        match self {
+            Self::WORLD => create_bind_group_layout_entry_buffer(
+                self,
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                wgpu::BufferBindingType::Uniform,
+            ),
+            Self::ORIGIN => {
+                let mut entry = create_bind_group_layout_entry_buffer(
+                    self,
+                    wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    wgpu::BufferBindingType::Uniform,
+                );
+                entry.ty = wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    min_binding_size: wgpu::BufferSize::new(self.size() * ORIGIN_BUFFER_SIZE as u64),
+                    has_dynamic_offset: false,
+                };
+                entry
+            },
+        }
+    }
+
+    fn buffer_descriptor(&self, _count: u64) -> wgpu::BufferDescriptor<'static> {
+        wgpu::BufferDescriptor {
+            label: Some(match self {
+                Self::WORLD => "World uniform buffer",
+                Self::ORIGIN => "Origin uniform buffer",
+            }),
+            size: match self {
+                Self::WORLD => self.size(),
+                Self::ORIGIN => self.size() * ORIGIN_BUFFER_SIZE as u64,
+            },
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum QuadGroup {
+    QUADS,
+}
+impl LayoutEnum for QuadGroup {
+    type Iter = <[Self; 1] as IntoIterator>::IntoIter;
+
+    fn entry_iter() -> Self::Iter {
+        [Self::QUADS].into_iter()
+    }
+    fn size(&self) -> u64 {
+        pad_to_copy_buffer_alignment(size_of::<Quad>() as u64)
+    }
+
+    fn binding(&self) -> u32 {
+        0
+    }
+
+    fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry {
+        create_bind_group_layout_entry_buffer(
+            self,
+            wgpu::ShaderStages::VERTEX,
+            wgpu::BufferBindingType::Storage { read_only: true }
+        )
+    }
+
+    fn buffer_descriptor(&self, count: u64) -> wgpu::BufferDescriptor<'static> {
+        wgpu::BufferDescriptor {
+            label: Some("quad buffer"),
+            size: self.size() * count,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VertexGroup {
+    VERTEX,
+    SEGMENT,
+}
+
+impl LayoutEnum for VertexGroup {
+    type Iter = <[Self; 2] as IntoIterator>::IntoIter;
+
+    fn entry_iter() -> Self::Iter {
+        [Self::VERTEX, Self::SEGMENT].into_iter()
+    }
+    fn size(&self) -> u64 {
+        pad_to_copy_buffer_alignment(match self {
+            Self::VERTEX => size_of::<Vertex>() as u64,
+            Self::SEGMENT => size_of::<Segment>() as u64,
+        })
+    }
+    fn binding(&self) -> u32 {
+        match self {
+            Self::VERTEX => 0,
+            Self::SEGMENT => 1,
+        }
+    }
+    fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry {
+        match self {
+            Self::VERTEX => create_bind_group_layout_entry_buffer(
+                self,
+                wgpu::ShaderStages::FRAGMENT,
+                wgpu::BufferBindingType::Storage { read_only: true }
+            ),
+            Self::SEGMENT => create_bind_group_layout_entry_buffer(
+                self,
+                wgpu::ShaderStages::FRAGMENT,
+                wgpu::BufferBindingType::Storage { read_only: true }
+            ),
+        }
+    }
+
+    fn buffer_descriptor(&self, count: u64) -> wgpu::BufferDescriptor<'static> {
+        wgpu::BufferDescriptor {
+            label: Some(match self {
+                Self::VERTEX => "Vertex storage buffer",
+                Self::SEGMENT => "Segment storage buffer",
+            }),
+            size: self.size() * count,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }
     }
 }

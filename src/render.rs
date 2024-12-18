@@ -44,7 +44,7 @@ impl RenderContext {
     async fn new_device(&mut self, compatible_surface: Option<&wgpu::Surface<'_>>) -> Option<DeviceId> {
         let adapter = self.instance.request_adapter(
             &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface,
                 force_fallback_adapter: false,
             }
@@ -87,6 +87,48 @@ pub struct DeviceHandle {
     adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+}
+
+impl DeviceHandle {
+    pub fn create_bind_group_layout<T: LayoutEnum> (&self, label: wgpu::Label<'_>) -> wgpu::BindGroupLayout {
+        let entries : Vec<_> = T::entry_iter()
+            .map(|t| T::layout_entry(&t))
+            .collect();
+        self
+            .device
+            .create_bind_group_layout( &wgpu::BindGroupLayoutDescriptor {
+                entries: entries.as_slice(),
+                label,
+            })
+    }
+
+    pub fn create_buffer_with_layout_enum<T: LayoutEnum> (&self, ty: &T, count: u64) -> wgpu::Buffer {
+        self
+            .device
+            .create_buffer(&ty.buffer_descriptor(count))
+    }
+
+    /// Creates a bind group using a wgpu layout and a map sending enums to binding resources.
+    pub fn create_bind_group_with_enum_layout_map< 'l, 'a, T: LayoutEnum, F>
+    (
+        &self,
+        layout: &wgpu::BindGroupLayout,
+        label: wgpu::Label<'l>,
+        map: F,
+    ) -> wgpu::BindGroup where F: Fn(&T) -> wgpu::BindingResource<'a> {
+        let entries: Vec<wgpu::BindGroupEntry> = T::entry_iter()
+            .map(|t| wgpu::BindGroupEntry{
+                binding: t.binding(),
+                resource: map(&t),
+            })
+            .collect();
+        self.device
+            .create_bind_group(&wgpu::BindGroupDescriptor{
+                label,
+                layout,
+                entries: entries.as_slice(),
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -258,4 +300,13 @@ pub struct TargetData {
     pub vp_y: i32,
     pub vp_width: u32,
     pub vp_height: u32,
+}
+
+pub trait LayoutEnum {
+    type Iter : Iterator<Item = Self>;
+    fn entry_iter() -> Self::Iter;
+    fn size(&self) -> u64;
+    fn binding(&self) -> u32;
+    fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry;
+    fn buffer_descriptor(&self, count: u64) -> wgpu::BufferDescriptor<'static>;
 }
