@@ -9,6 +9,7 @@ use log::{info, warn};
 mod scene;
 mod render;
 mod engine;
+mod model;
 
 use scene::SceneData;
 use render::{

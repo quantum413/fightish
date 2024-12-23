@@ -1,107 +1,16 @@
 use std::num::NonZeroU64;
 use anyhow::{anyhow, Result};
-use cgmath::SquareMatrix;
-use crate::render::{DeviceHandle, DeviceId, RenderContext, TargetTextureDongle, LayoutEnum};
+use crate::model::*;
+use crate::render::{DeviceHandle, DeviceId, LayoutEnum, RenderContext, TargetTextureDongle};
 use crate::scene::{SceneData, Shard};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
-const ORIGIN_BUFFER_SIZE: u32 = 5;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    // note even though only really using 2+1D transformations, the alignments on vec3's are a real pain.
-    clip_world_tf: [[f32; 4]; 4], // tf from world coordinates to clip coordinates (for bb purposes)
-    world_frag_tf: [[f32; 4]; 4], // tf from fragment coordinates to world coordinates.
-}
-
-impl Uniforms {
-    fn get(scene_data: &SceneData) -> Self {
-        let clip_frag_tf = // scaled -1 to +1 (clip coords)
-            cgmath::Matrix4::from_translation(cgmath::vec3(-1f32, 1f32, 0f32))
-                * // scaled from 0 to +2 for x and -2 to 0 for y
-                cgmath::Matrix4::from_nonuniform_scale(
-                    2f32 / scene_data.vp_width as f32,
-                    -2f32 / scene_data.vp_height as f32,
-                    1f32,
-                )
-                * // scaled from 0 to width/height
-                cgmath::Matrix4::from_translation(cgmath::vec3(
-                    -scene_data.vp_x as f32,
-                    -scene_data.vp_y as f32,
-                    0f32,
-                )); // scaled from vp_x/y to width + vp_x / height + vp_y
-
-        let world_clip_tf = scene_data.camera_tf;
-
-        Self {
-            clip_world_tf: world_clip_tf.invert().unwrap().into(),
-            world_frag_tf: (world_clip_tf * clip_frag_tf).into(),
-        }
-    }
-}
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Origin {
-    world_tex_tf: [[f32; 4]; 4]
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Quad {
-    bb: [f32; 4],
-    color: [f32; 4],
-    segment_index_range: [i32; 2],
-    clip_depth: u32,
-    origin_index: u32,
-}
-
-const QUAD_BUFFER_SIZE: u32 = 10;
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    pos: [f32; 2]
-}
-
-const VERTICES: &[Vertex] = &[
-    Vertex {pos: [ 0.0, 0.0]},
-    Vertex {pos: [ 0.5, 1.0]},
-    Vertex {pos: [-0.5, 0.5]},
-    Vertex {pos: [ 0.0,-0.5]},
-    Vertex {pos: [ 0.2, 1.0]},
-];
-
-const VERT_BUFFER_SIZE: u32 = 15;
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Segment {
-    idx: [i32; 4] // making this signed in case using negative values for special cases later
-}
-
-const SEGMENTS: &[Segment] = &[
-    Segment {idx: [0, 2, -1, -1]},
-    Segment {idx: [2, 0, 3, -1]},
-    Segment {idx: [3, 1, -1, -1]},
-    Segment {idx: [1, 0, -1, -1]},
-
-    Segment {idx: [0, 1, -1, -1]},
-    Segment {idx: [1, 4, -1, -1]},
-    Segment {idx: [4, 0, -1, -1]},
-];
-
-const SEGMENT_INDEX_RANGES: &[[i32; 2]] = &[[0, 4], [4, 7]];
-
-const SEGMENT_BUFFER_SIZE: u32 = 20;
 
 fn pad_to_copy_buffer_alignment(size: wgpu::BufferAddress) -> wgpu::BufferAddress {
     let align_mask = wgpu::COPY_BUFFER_ALIGNMENT - 1; // 0b11 since copy buffer alignment is 4
     ((size + align_mask) & !align_mask) // round up to nearest aligned
         .max(wgpu::COPY_BUFFER_ALIGNMENT) // make sure it's non-empty
 }
-
-
 
 #[derive(Debug)]
 pub struct RenderEngine {
@@ -118,6 +27,7 @@ pub struct RenderEngine {
 
 impl RenderEngine {
     pub fn new(context: &RenderContext, device_id: DeviceId, format: &wgpu::TextureFormat) -> RenderEngine {
+        let info = check::MODEL_INFO;
         let device = context.get_device_by_id(device_id);
         let shader = device
             .device
@@ -210,7 +120,7 @@ impl RenderEngine {
             );
 
         let quad_buffer = device
-            .create_buffer_with_layout_enum(&QuadGroup::QUADS, QUAD_BUFFER_SIZE as u64);
+            .create_buffer_with_layout_enum(&QuadGroup::QUADS, info.requested_quads as u64);
         let quad_bind_group = device
             .create_bind_group_with_enum_layout_map(
                 &quad_bind_group_layout,
@@ -221,9 +131,9 @@ impl RenderEngine {
             );
 
         let vertex_buffer = device
-            .create_buffer_with_layout_enum(&VertexGroup::VERTEX, VERT_BUFFER_SIZE as u64);
+            .create_buffer_with_layout_enum(&VertexGroup::VERTEX, info.num_vertices as u64);
         let segment_buffer = device
-            .create_buffer_with_layout_enum(&VertexGroup::SEGMENT, SEGMENT_BUFFER_SIZE as u64);
+            .create_buffer_with_layout_enum(&VertexGroup::SEGMENT, info.num_segments as u64);
 
         let vert_bind_group = device
             .create_bind_group_with_enum_layout_map(
@@ -234,26 +144,26 @@ impl RenderEngine {
                     VertexGroup::SEGMENT => segment_buffer.as_entire_binding(),
                 }
             );
-
+        let model = check::model();
         device
             .queue
             .write_buffer_with(
                 &vertex_buffer,
                 0,
-                wgpu::BufferSize::new((size_of::<Vertex>() * VERTICES.len()) as u64).unwrap(),
+                wgpu::BufferSize::new((size_of::<Vertex>() * model.vertices.len()) as u64).unwrap(),
             )
             .unwrap()// eventually will move this to loading code, can handle errors after that
-            .copy_from_slice(bytemuck::cast_slice(VERTICES));
+            .copy_from_slice(bytemuck::cast_slice(model.vertices.as_slice()));
 
         device
             .queue
             .write_buffer_with(
                 &segment_buffer,
                 0,
-                wgpu::BufferSize::new((size_of::<Segment>() * SEGMENTS.len()) as u64).unwrap(),
+                wgpu::BufferSize::new((size_of::<Segment>() * model.segments.len()) as u64).unwrap(),
             )
             .unwrap()
-            .copy_from_slice(bytemuck::cast_slice(SEGMENTS));
+            .copy_from_slice(bytemuck::cast_slice(model.segments.as_slice()));
 
 
         RenderEngine {
@@ -273,13 +183,14 @@ impl RenderEngine {
                          target_texture_views: &Vec<wgpu::TextureView>,
                          scene_data: &SceneData,
     ) -> Result<()> {
+        let info = check::MODEL_INFO;
         if scene_data.objects.len() >= ORIGIN_BUFFER_SIZE as usize {
             return Err(anyhow!("Number of shards exceeds buffer size."));
         }
 
         let shards: Vec<Shard> = self.get_shards(scene_data);
 
-        if shards.len() >= QUAD_BUFFER_SIZE as usize {
+        if shards.len() >= info.requested_quads {
             return Err(anyhow!("Number of shards exceeds buffer size."));
         }
 
@@ -290,7 +201,7 @@ impl RenderEngine {
                     label: Some("Render Encoder"),
                 }
             );
-
+        let ranges = check::model().segment_ranges;
         let mut view = device.queue.write_buffer_with(
             &self.quad_buffer,
             0,
@@ -304,7 +215,10 @@ impl RenderEngine {
                 bytemuck::cast_slice_mut(&mut *view)[i] = Quad {
                     bb: e.tex_bb.into(),
                     color: e.color.into(),
-                    segment_index_range: SEGMENT_INDEX_RANGES[e.tex_id],
+                    segment_index_range: [
+                        ranges[e.tex_id].start,
+                        ranges[e.tex_id].end,
+                    ],
                     clip_depth: e.clip_depth,
                     origin_index: e.origin_index as u32,
                 }
