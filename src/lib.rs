@@ -54,7 +54,10 @@ impl AppState {
 
             camera_tf,
 
-            objects: vec![scene::Object{world_local_tf: object_tf, model_id: 0}]
+            objects: vec![
+                scene::Object{world_local_tf: object_tf, frame_index: 0},
+                scene::Object{world_local_tf: cgmath::SquareMatrix::identity(), frame_index: 0},
+            ]
         }
     }
 

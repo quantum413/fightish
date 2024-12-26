@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 use anyhow::{anyhow, Result};
 use crate::model::*;
 use crate::render::{DeviceHandle, DeviceId, LayoutEnum, RenderContext, TargetTextureDongle};
-use crate::scene::{SceneData, Shard};
+use crate::scene::{SceneData};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 
@@ -15,14 +15,24 @@ fn pad_to_copy_buffer_alignment(size: wgpu::BufferAddress) -> wgpu::BufferAddres
 #[derive(Debug)]
 pub struct RenderEngine {
     render_pipeline: wgpu::RenderPipeline,
+    compute_pipeline: wgpu::ComputePipeline,
+
     world_uniforms_buffer: wgpu::Buffer,
-    origin_uniforms_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
-    quad_bind_group: wgpu::BindGroup,
-    quad_buffer: wgpu::Buffer,
-    vertex_buffer: wgpu::Buffer,
-    segment_buffer: wgpu::Buffer,
-    vert_bind_group: wgpu::BindGroup,
+
+    shard_vertex_frame_buffer: wgpu::Buffer,
+    segment_frame_buffer: wgpu::Buffer,
+    frame_bind_group: wgpu::BindGroup,
+    frame_read_bind_group: wgpu::BindGroup,
+
+    vertex_model_buffer: wgpu::Buffer,
+    segment_model_buffer: wgpu::Buffer,
+    shard_model_buffer: wgpu::Buffer,
+    frame_model_buffer: wgpu::Buffer,
+    model_bind_group: wgpu::BindGroup,
+
+    object_scene_buffer: wgpu::Buffer,
+    scene_bind_group: wgpu::BindGroup,
 }
 
 impl RenderEngine {
@@ -38,21 +48,49 @@ impl RenderEngine {
                 }
             );
 
+        let compute_shader = device
+            .device
+            .create_shader_module(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("Frame preprocessing compute shader"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("frame_preprocess.wgsl").into())
+                }
+            );
+
 
         let uniform_bind_group_layout = device
             .create_bind_group_layout::<UniformGroup>(Some("Uniform bind group layout"));
-        let quad_bind_group_layout = device
-            .create_bind_group_layout::<QuadGroup>(Some("Quad bind group layout"));
-        let vert_bind_group_layout = device
-            .create_bind_group_layout::<VertexGroup>(Some("Vertex bind group layout"));
+        let frame_bind_group_layout = device
+            .create_bind_group_layout::<FrameGroup>(Some("Frame bind group layout"));
+        let frame_read_bind_group_layout = device
+            .device
+            .create_bind_group_layout( &wgpu::BindGroupLayoutDescriptor {
+                entries:
+                &[
+                    create_bind_group_layout_entry_buffer(
+                        &FrameGroup::Segment,
+                        wgpu::ShaderStages::FRAGMENT,
+                        wgpu::BufferBindingType::Storage {read_only: true,}
+                    ),
+                    create_bind_group_layout_entry_buffer(
+                        &FrameGroup::ShardVertex,
+                        wgpu::ShaderStages::VERTEX,
+                        wgpu::BufferBindingType::Storage {read_only: true,}
+                    ),
+                ],
+                label: Some("Frame read bind group layout")
+            });
+        let model_bind_group_layout = device
+            .create_bind_group_layout::<ModelGroup>(Some("Model bind group layout"));
+        let scene_bind_group_layout = device
+            .create_bind_group_layout::<SceneGroup>(Some("Object bind group layout"));
         let render_pipeline_layout = device
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
                 bind_group_layouts: &[
                     &uniform_bind_group_layout,
-                    &quad_bind_group_layout,
-                    &vert_bind_group_layout,
+                    &frame_read_bind_group_layout,
                 ],
                 push_constant_ranges: &[],
             });
@@ -104,78 +142,153 @@ impl RenderEngine {
                 cache: None,
             });
 
+        let compute_pipeline_layout = device
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{
+                label: Some("Compute pipeline layout"),
+                bind_group_layouts: &[
+                    &uniform_bind_group_layout,
+                    &frame_bind_group_layout,
+                    &model_bind_group_layout,
+                    &scene_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+
+        let compute_pipeline = device
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
+                label: Some("Compute pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &compute_shader,
+                entry_point: "main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
         let world_uniforms_buffer = device
-            .create_buffer_with_layout_enum(&UniformGroup::WORLD, 1);
-        let origin_uniforms_buffer = device
-            .create_buffer_with_layout_enum(&UniformGroup::ORIGIN, ORIGIN_BUFFER_SIZE as u64);
+            .create_buffer_with_layout_enum(&UniformGroup::World, 1);
         let uniform_bind_group = device
             .create_bind_group_with_enum_layout_map(
                 &uniform_bind_group_layout,
                 Some("Uniform bind group"),
                 |t| match t {
-                    UniformGroup::WORLD => world_uniforms_buffer.as_entire_binding(),
-                    UniformGroup::ORIGIN => origin_uniforms_buffer.as_entire_binding(),
+                    UniformGroup::World => world_uniforms_buffer.as_entire_binding(),
                 }
             );
 
-        let quad_buffer = device
-            .create_buffer_with_layout_enum(&QuadGroup::QUADS, info.requested_quads as u64);
-        let quad_bind_group = device
+        let segment_frame_buffer = device
+            .create_buffer_with_layout_enum(&FrameGroup::Segment, info.requested_frame_segments as u64);
+        let shard_vertex_frame_buffer = device
+            .create_buffer_with_layout_enum(&FrameGroup::ShardVertex, info.requested_frame_shards as u64 * 6);
+        let frame_bind_group = device
             .create_bind_group_with_enum_layout_map(
-                &quad_bind_group_layout,
-                Some("Quad bind group"),
+                &frame_bind_group_layout,
+                Some("Frame bind group"),
                 |t| match t {
-                    QuadGroup::QUADS => quad_buffer.as_entire_binding(),
+                    FrameGroup::Segment => segment_frame_buffer.as_entire_binding(),
+                    FrameGroup::ShardVertex => shard_vertex_frame_buffer.as_entire_binding(),
                 }
             );
-
-        let vertex_buffer = device
-            .create_buffer_with_layout_enum(&VertexGroup::VERTEX, info.num_vertices as u64);
-        let segment_buffer = device
-            .create_buffer_with_layout_enum(&VertexGroup::SEGMENT, info.num_segments as u64);
-
-        let vert_bind_group = device
+        let frame_read_bind_group = device
             .create_bind_group_with_enum_layout_map(
-                &vert_bind_group_layout,
-                Some("Vertex bind group"),
+                &frame_read_bind_group_layout,
+                Some("Frame read bind group"),
                 |t| match t {
-                    VertexGroup::VERTEX => vertex_buffer.as_entire_binding(),
-                    VertexGroup::SEGMENT => segment_buffer.as_entire_binding(),
+                    FrameGroup::Segment => segment_frame_buffer.as_entire_binding(),
+                    FrameGroup::ShardVertex => shard_vertex_frame_buffer.as_entire_binding(),
                 }
             );
+
+        let vertex_model_buffer = device
+            .create_buffer_with_layout_enum(&ModelGroup::Vertex, info.num_vertices as u64);
+        let segment_model_buffer = device
+            .create_buffer_with_layout_enum(&ModelGroup::Segment, info.num_segments as u64);
+        let shard_model_buffer = device
+            .create_buffer_with_layout_enum(&ModelGroup::Shard, info.num_shards as u64);
+        let frame_model_buffer = device
+            .create_buffer_with_layout_enum(&ModelGroup::Frame, info.num_frames as u64);
+        let model_bind_group = device
+            .create_bind_group_with_enum_layout_map(
+                &model_bind_group_layout,
+                Some("Model bind group"),
+                |t| match t {
+                    ModelGroup::Vertex => vertex_model_buffer.as_entire_binding(),
+                    ModelGroup::Segment => segment_model_buffer.as_entire_binding(),
+                    ModelGroup::Shard => shard_model_buffer.as_entire_binding(),
+                    ModelGroup::Frame => frame_model_buffer.as_entire_binding(),
+                }
+            );
+
+        let object_scene_buffer = device
+            .create_buffer_with_layout_enum(&SceneGroup::Object, info.requested_scene_objects as u64);
+        let scene_bind_group = device
+            .create_bind_group_with_enum_layout_map(
+                &scene_bind_group_layout,
+                Some("Scene bind group"),
+                |t| match t {
+                    SceneGroup::Object => object_scene_buffer.as_entire_binding(),
+                }
+            );
+
         let model = check::model();
         device
             .queue
             .write_buffer_with(
-                &vertex_buffer,
+                &vertex_model_buffer,
                 0,
-                wgpu::BufferSize::new((size_of::<Vertex>() * model.vertices.len()) as u64).unwrap(),
+                wgpu::BufferSize::new(ModelGroup::Vertex.size() * model.vertices.len() as u64).unwrap()
             )
-            .unwrap()// eventually will move this to loading code, can handle errors after that
+            .unwrap()
             .copy_from_slice(bytemuck::cast_slice(model.vertices.as_slice()));
-
         device
             .queue
             .write_buffer_with(
-                &segment_buffer,
+                &segment_model_buffer,
                 0,
-                wgpu::BufferSize::new((size_of::<Segment>() * model.segments.len()) as u64).unwrap(),
+                wgpu::BufferSize::new(ModelGroup::Segment.size() * model.segments.len() as u64).unwrap()
             )
             .unwrap()
             .copy_from_slice(bytemuck::cast_slice(model.segments.as_slice()));
-
+        device
+            .queue
+            .write_buffer_with(
+                &shard_model_buffer,
+                0,
+                wgpu::BufferSize::new(ModelGroup::Shard.size() * model.shards.len() as u64).unwrap()
+            )
+            .unwrap()
+            .copy_from_slice(bytemuck::cast_slice(model.shards.as_slice()));
+        device
+            .queue
+            .write_buffer_with(
+                &frame_model_buffer,
+                0,
+                wgpu::BufferSize::new(ModelGroup::Frame.size() * model.frames.len() as u64).unwrap()
+            )
+            .unwrap()
+            .copy_from_slice(bytemuck::cast_slice(model.frames.as_slice()));
 
         RenderEngine {
             render_pipeline,
+            compute_pipeline,
+
             world_uniforms_buffer,
-            origin_uniforms_buffer,
             uniform_bind_group,
-            quad_bind_group,
-            quad_buffer,
-            vertex_buffer,
-            segment_buffer,
-            vert_bind_group,
+
+            shard_vertex_frame_buffer,
+            segment_frame_buffer,
+            frame_bind_group,
+            frame_read_bind_group,
+
+            vertex_model_buffer,
+            segment_model_buffer,
+            shard_model_buffer,
+            frame_model_buffer,
+            model_bind_group,
+
+            object_scene_buffer,
+            scene_bind_group,
         }
     }
     pub fn render(&self, device: &DeviceHandle,
@@ -184,14 +297,27 @@ impl RenderEngine {
                          scene_data: &SceneData,
     ) -> Result<()> {
         let info = check::MODEL_INFO;
-        if scene_data.objects.len() >= ORIGIN_BUFFER_SIZE as usize {
-            return Err(anyhow!("Number of shards exceeds buffer size."));
+        let frame_info = check::FRAME_INFO;
+        if scene_data.objects.len() > info.requested_scene_objects {
+            return Err(anyhow!("Number of objects exceeds buffer size."));
         }
+        let shard_extent: u32 = scene_data
+            .objects
+            .iter()
+            .map(|o| check::FRAME_INFO[o.frame_index as usize].shard_size)
+            .sum();
 
-        let shards: Vec<Shard> = self.get_shards(scene_data);
+        let segment_extent: u32 = scene_data
+            .objects
+            .iter()
+            .map(|o| check::FRAME_INFO[o.frame_index as usize].shard_size)
+            .sum();
 
-        if shards.len() >= info.requested_quads {
-            return Err(anyhow!("Number of shards exceeds buffer size."));
+        if shard_extent > info.requested_frame_shards as u32 {
+            return Err(anyhow!("Number of frame shards exceeds buffer size."));
+        }
+        if segment_extent > info.requested_frame_segments as u32 {
+            return Err(anyhow!("Number of frame segments exceeds buffer size."));
         }
 
         let mut encoder = device
@@ -201,28 +327,31 @@ impl RenderEngine {
                     label: Some("Render Encoder"),
                 }
             );
-        let ranges = check::model().segment_ranges;
+
         let mut view = device.queue.write_buffer_with(
-            &self.quad_buffer,
+            &self.object_scene_buffer,
             0,
-            wgpu::BufferSize::new(QuadGroup::QUADS.size() * shards.len() as u64).unwrap(),
+            wgpu::BufferSize::new(SceneGroup::Object.size() * scene_data.objects.len() as u64).unwrap(),
         )
-            .ok_or(anyhow!("Unable to get quad buffer view"))?;
-        shards
-            .iter()
-            .enumerate()
-            .for_each(|(i, e)| {
-                bytemuck::cast_slice_mut(&mut *view)[i] = Quad {
-                    bb: e.tex_bb.into(),
-                    color: e.color.into(),
-                    segment_index_range: [
-                        ranges[e.tex_id].start,
-                        ranges[e.tex_id].end,
-                    ],
-                    clip_depth: e.clip_depth,
-                    origin_index: e.origin_index as u32,
-                }
-            });
+            .ok_or(anyhow!("Unable to get object buffer view"))?;
+        let mut clip_offset: u32 = 0;
+        let mut shard_offset: i32 = 0;
+        let mut segment_offset: i32 = 0;
+
+        for i in 0..scene_data.objects.len() {
+            let o = &scene_data.objects[i];
+            bytemuck::cast_slice_mut(&mut *view)[i] = FrameObject {
+                world_tex_tf: o.world_local_tf.into(),
+                frame_index: o.frame_index,
+                clip_offset,
+                shard_offset,
+                segment_offset,
+            };
+            let frame: &FrameInfo = &frame_info[o.frame_index as usize];
+            clip_offset += frame.clip_size;
+            shard_offset += frame.shard_size as i32;
+            segment_offset += frame.segment_size as i32;
+        }
         drop(view);
 
         let mut view = device
@@ -230,7 +359,7 @@ impl RenderEngine {
             .write_buffer_with(
                 &self.world_uniforms_buffer,
                 0,
-                wgpu::BufferSize::new(UniformGroup::WORLD.size()).unwrap(),
+                wgpu::BufferSize::new(UniformGroup::World.size()).unwrap(),
             )
             .ok_or(anyhow!("Could not write to world uniforms buffer"))?;
         view.copy_from_slice(bytemuck::cast_slice(
@@ -238,25 +367,17 @@ impl RenderEngine {
         ));
         drop(view);
 
-        let mut view = device
-            .queue
-            .write_buffer_with(
-                &self.origin_uniforms_buffer,
-                0,
-                wgpu::BufferSize::new(
-                    UniformGroup::ORIGIN.size() * scene_data.objects.len() as u64
-                ).unwrap()
-            ).ok_or(anyhow!("Could not write to origin uniform buffer"))?;
-        scene_data
-            .objects
-            .iter()
-            .enumerate()
-            .for_each(|(i, o)|
-                bytemuck::cast_slice_mut(&mut *view)[i] = Origin {
-                    world_tex_tf: o.world_local_tf.into(),
-                }
-            );
-        drop(view);
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor{
+            label: Some("Frame Preprocessing Pass"),
+            timestamp_writes: None,
+        });
+        compute_pass.set_pipeline(&self.compute_pipeline);
+        compute_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        compute_pass.set_bind_group(1, &self.frame_bind_group, &[]);
+        compute_pass.set_bind_group(2, &self.model_bind_group, &[]);
+        compute_pass.set_bind_group(3, &self.scene_bind_group, &[]);
+        compute_pass.dispatch_workgroups(scene_data.objects.len() as u32, 1, 1);
+        drop(compute_pass);
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
@@ -286,38 +407,12 @@ impl RenderEngine {
         });
         render_pass.set_pipeline(&self.render_pipeline);
         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.quad_bind_group, &[]);
-        render_pass.set_bind_group(2, &self.vert_bind_group, &[]);
-        render_pass.draw(0..(shards.len() * 6) as u32, 0..1);
+        render_pass.set_bind_group(1, &self.frame_read_bind_group, &[]);
+        render_pass.draw(0..(shard_extent * 6), 0..1);
         drop(render_pass);
 
         device.queue.submit(std::iter::once(encoder.finish()));
         Ok(())
-    }
-
-    fn get_shards(&self, scene_data: &SceneData) -> Vec<Shard> {
-        scene_data
-            .objects
-            .iter()
-            .enumerate()
-            .map(|(i, _)| [
-                Shard {
-                    tex_bb: cgmath::Vector4::new(-1.0f32, -1.0f32, 1.0f32, 1.0f32),
-                    color: cgmath::Vector4::new(1.0, 0.0, 0.0, 1.0),
-                    clip_depth: 1,
-                    tex_id: 0,
-                    origin_index: i,
-                },
-                Shard {
-                    tex_bb: cgmath::Vector4::new(-0.2f32, 0.2f32, 1.3f32, 1.5f32),
-                    color: cgmath::Vector4::new(0.0, 0.0, 1.0, 1.0),
-                    clip_depth: 2,
-                    tex_id: 1,
-                    origin_index: i,
-                },
-            ])
-            .flatten()
-            .collect()
     }
 }
 
@@ -368,60 +463,42 @@ fn create_bind_group_layout_entry_buffer<T: LayoutEnum>(
 
 #[derive(Debug, Clone, Copy)]
 enum UniformGroup {
-    WORLD,
-    ORIGIN,
+    World,
 }
 
 impl LayoutEnum for UniformGroup {
-    type Iter = <[Self; 2] as IntoIterator>::IntoIter;
+    type Iter = <[Self; 1] as IntoIterator>::IntoIter;
     fn entry_iter() -> Self::Iter {
-        [Self::WORLD, Self::ORIGIN].into_iter()
+        [Self::World].into_iter()
     }
     fn size(&self) -> u64 {
         pad_to_copy_buffer_alignment(match self {
-            Self::WORLD => size_of::<Uniforms>() as u64,
-            Self::ORIGIN => size_of::<Origin>() as u64,
+            Self::World => size_of::<Uniforms>() as u64,
         })
     }
     fn binding(&self) -> u32 {
         match self {
-            Self::WORLD => 0,
-            Self::ORIGIN => 1,
+            Self::World => 0,
         }
     }
 
     fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry {
         match self {
-            Self::WORLD => create_bind_group_layout_entry_buffer(
+            Self::World => create_bind_group_layout_entry_buffer(
                 self,
-                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 wgpu::BufferBindingType::Uniform,
             ),
-            Self::ORIGIN => {
-                let mut entry = create_bind_group_layout_entry_buffer(
-                    self,
-                    wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    wgpu::BufferBindingType::Uniform,
-                );
-                entry.ty = wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    min_binding_size: wgpu::BufferSize::new(self.size() * ORIGIN_BUFFER_SIZE as u64),
-                    has_dynamic_offset: false,
-                };
-                entry
-            },
         }
     }
 
     fn buffer_descriptor(&self, _count: u64) -> wgpu::BufferDescriptor<'static> {
         wgpu::BufferDescriptor {
             label: Some(match self {
-                Self::WORLD => "World uniform buffer",
-                Self::ORIGIN => "Origin uniform buffer",
+                Self::World => "World uniform buffer",
             }),
             size: match self {
-                Self::WORLD => self.size(),
-                Self::ORIGIN => self.size() * ORIGIN_BUFFER_SIZE as u64,
+                Self::World => self.size(),
             },
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -430,34 +507,96 @@ impl LayoutEnum for UniformGroup {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum QuadGroup {
-    QUADS,
+enum ModelGroup {
+    Vertex,
+    Segment,
+    Shard,
+    Frame,
 }
-impl LayoutEnum for QuadGroup {
-    type Iter = <[Self; 1] as IntoIterator>::IntoIter;
+
+impl LayoutEnum for ModelGroup {
+    type Iter = <[Self; 4] as IntoIterator>::IntoIter;
 
     fn entry_iter() -> Self::Iter {
-        [Self::QUADS].into_iter()
+        [Self::Vertex, Self::Segment, Self::Shard, Self::Frame].into_iter()
     }
+
     fn size(&self) -> u64 {
-        pad_to_copy_buffer_alignment(size_of::<Quad>() as u64)
+        match self {
+            ModelGroup::Vertex => 8,
+            ModelGroup::Segment => 16,
+            ModelGroup::Shard => size_of::<ModelShard>() as u64,
+            ModelGroup::Frame => size_of::<ModelFrame>() as u64,
+        }
     }
 
     fn binding(&self) -> u32 {
-        0
+        match self {
+            ModelGroup::Vertex => 0,
+            ModelGroup::Segment => 1,
+            ModelGroup::Shard => 2,
+            ModelGroup::Frame => 3,
+        }
     }
 
     fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry {
         create_bind_group_layout_entry_buffer(
             self,
-            wgpu::ShaderStages::VERTEX,
-            wgpu::BufferBindingType::Storage { read_only: true }
+            wgpu::ShaderStages::COMPUTE,
+            wgpu::BufferBindingType::Storage {read_only: true}
         )
     }
 
     fn buffer_descriptor(&self, count: u64) -> wgpu::BufferDescriptor<'static> {
         wgpu::BufferDescriptor {
-            label: Some("quad buffer"),
+            label: Some(match self {
+                ModelGroup::Vertex => "Model vertex buffer",
+                ModelGroup::Segment => "Model segment buffer",
+                ModelGroup::Shard => "Model shard buffer",
+                ModelGroup::Frame => "Model frame buffer",
+            }),
+            size: self.size() * count,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum SceneGroup {
+    Object,
+}
+
+impl LayoutEnum for SceneGroup {
+    type Iter = <[Self; 1] as IntoIterator>::IntoIter;
+
+    fn entry_iter() -> Self::Iter {
+        [Self::Object].into_iter()
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            Self::Object => size_of::<FrameObject>() as u64
+        }
+    }
+
+    fn binding(&self) -> u32 {
+        match self {
+            Self::Object => 0,
+        }
+    }
+
+    fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry {
+        create_bind_group_layout_entry_buffer(
+            self,
+            wgpu::ShaderStages::COMPUTE,
+            wgpu::BufferBindingType::Storage {read_only: true}
+        )
+    }
+
+    fn buffer_descriptor(&self, count: u64) -> wgpu::BufferDescriptor<'static> {
+        wgpu::BufferDescriptor {
+            label: Some("Scene objects buffer"),
             size: self.size() * count,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -466,52 +605,48 @@ impl LayoutEnum for QuadGroup {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum VertexGroup {
-    VERTEX,
-    SEGMENT,
+enum FrameGroup {
+    Segment,
+    ShardVertex,
 }
 
-impl LayoutEnum for VertexGroup {
+impl LayoutEnum for FrameGroup {
     type Iter = <[Self; 2] as IntoIterator>::IntoIter;
 
     fn entry_iter() -> Self::Iter {
-        [Self::VERTEX, Self::SEGMENT].into_iter()
+        [Self::Segment, Self::ShardVertex].into_iter()
     }
+
     fn size(&self) -> u64 {
-        pad_to_copy_buffer_alignment(match self {
-            Self::VERTEX => size_of::<Vertex>() as u64,
-            Self::SEGMENT => size_of::<Segment>() as u64,
-        })
-    }
-    fn binding(&self) -> u32 {
         match self {
-            Self::VERTEX => 0,
-            Self::SEGMENT => 1,
-        }
-    }
-    fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry {
-        match self {
-            Self::VERTEX => create_bind_group_layout_entry_buffer(
-                self,
-                wgpu::ShaderStages::FRAGMENT,
-                wgpu::BufferBindingType::Storage { read_only: true }
-            ),
-            Self::SEGMENT => create_bind_group_layout_entry_buffer(
-                self,
-                wgpu::ShaderStages::FRAGMENT,
-                wgpu::BufferBindingType::Storage { read_only: true }
-            ),
+            Self::Segment => 32,
+            Self::ShardVertex => 48,
         }
     }
 
+    fn binding(&self) -> u32 {
+        match self {
+            Self::Segment => 0,
+            Self::ShardVertex => 1,
+        }
+    }
+
+    fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry {
+        create_bind_group_layout_entry_buffer(
+            self,
+            wgpu::ShaderStages::COMPUTE,
+            wgpu::BufferBindingType::Storage {read_only: false,}
+        )
+    }
+
     fn buffer_descriptor(&self, count: u64) -> wgpu::BufferDescriptor<'static> {
-        wgpu::BufferDescriptor {
+        wgpu::BufferDescriptor{
             label: Some(match self {
-                Self::VERTEX => "Vertex storage buffer",
-                Self::SEGMENT => "Segment storage buffer",
+                Self::Segment => "Frame segments buffer",
+                Self::ShardVertex => "Frame shards vertex buffer",
             }),
             size: self.size() * count,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         }
     }

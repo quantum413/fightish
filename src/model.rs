@@ -1,8 +1,5 @@
 use cgmath::SquareMatrix;
-use crate::scene::{SceneData, Shard};
-use std::ops::Range;
-
-pub const ORIGIN_BUFFER_SIZE: u32 = 5;
+use crate::scene::{SceneData};
 
 
 // ideally one wouldn't waste memory on having a cpu copy of the model.
@@ -10,15 +7,18 @@ pub const ORIGIN_BUFFER_SIZE: u32 = 5;
 pub struct Model {
     pub vertices: Vec<Vertex>,
     pub segments: Vec<Segment>,
-    pub segment_ranges: Vec<Range<i32>>,
-    pub shards: Vec<Shard>,
-    pub frames: Vec<Range<usize>>,
+    pub shards: Vec<ModelShard>,
+    pub frames: Vec<ModelFrame>,
 }
 
 pub struct ModelInfo {
     pub num_vertices: usize,
     pub num_segments: usize,
-    pub requested_quads: usize,
+    pub num_shards: usize,
+    pub num_frames: usize,
+    pub requested_frame_shards: usize,
+    pub requested_frame_segments: usize,
+    pub requested_scene_objects: usize,
 }
 
 #[repr(C)]
@@ -26,7 +26,7 @@ pub struct ModelInfo {
 pub struct Uniforms {
     // note even though only really using 2+1D transformations, the alignments on vec3's are a real pain.
     pub clip_world_tf: [[f32; 4]; 4], // tf from world coordinates to clip coordinates (for bb purposes)
-    pub world_frag_tf: [[f32; 4]; 4], // tf from fragment coordinates to world coordinates.
+    pub frag_clip_tf: [[f32; 4]; 4], // tf from fragment coordinates to world coordinates.
 }
 
 impl Uniforms {
@@ -50,25 +50,9 @@ impl Uniforms {
 
         Self {
             clip_world_tf: world_clip_tf.invert().unwrap().into(),
-            world_frag_tf: (world_clip_tf * clip_frag_tf).into(),
+            frag_clip_tf: clip_frag_tf.invert().unwrap().into(),
         }
     }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Origin {
-    pub world_tex_tf: [[f32; 4]; 4]
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Quad {
-    pub bb: [f32; 4],
-    pub color: [f32; 4],
-    pub segment_index_range: [i32; 2],
-    pub clip_depth: u32,
-    pub origin_index: u32,
 }
 
 #[repr(C)]
@@ -82,6 +66,41 @@ pub struct Vertex {
 pub struct Segment {
     pub idx: [i32; 4] // making this signed in case using negative values for special cases later
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ModelShard {
+    pub bb: [f32; 4],
+    pub color: [f32; 4],
+    pub segment_range: [i32; 2],
+    pub clip_depth: u32,
+    pub filler: u32,
+}
+
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ModelFrame {
+    pub shard_range: [i32; 2],
+    pub segment_range: [i32; 2],
+}
+
+pub struct FrameInfo {
+    pub clip_size: u32,
+    pub shard_size: u32,
+    pub segment_size: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FrameObject {
+    pub world_tex_tf: [[f32; 4]; 4],
+    pub frame_index: i32,
+    pub clip_offset: u32,
+    pub shard_offset: i32,
+    pub segment_offset: i32,
+}
+
 pub mod check {
     use super::*;
 
@@ -94,40 +113,59 @@ pub mod check {
     ];
     pub const SEGMENTS: &[Segment] = &[
         Segment { idx: [0, 2, -1, -1] },
-        Segment { idx: [2, 0, 3, -1] },
+        Segment { idx: [2, 3, 0, -1] },
         Segment { idx: [3, 1, -1, -1] },
         Segment { idx: [1, 0, -1, -1] },
         Segment { idx: [0, 1, -1, -1] },
         Segment { idx: [1, 4, -1, -1] },
         Segment { idx: [4, 0, -1, -1] },
     ];
-    pub const SEGMENT_INDEX_RANGES: &[Range<i32>] = &[0..4, 4..7];
+    // pub const SEGMENT_INDEX_RANGES: &[Range<i32>] = &[0..4, 4..7];
+    pub const SHARDS: &[ModelShard] = &[
+        ModelShard {
+            bb: [-1.0f32, -1.0f32, 1.0f32, 1.0f32],
+            color: [1.0, 0.0, 0.0, 1.0],
+            segment_range: [0, 4],
+            clip_depth: 0,
+            filler: 0,
+        },
+        ModelShard {
+            bb: [-0.2f32, 0.2f32, 1.3f32, 1.5f32],
+            color: [0.0, 0.0, 1.0, 1.0],
+            segment_range: [4, 7],
+            clip_depth: 1,
+            filler: 0,
+        },];
+
+    pub const FRAMES: &[ModelFrame] = &[
+        ModelFrame {
+            shard_range: [0, 2],
+            segment_range: [0, 7],
+        }
+    ];
+
+    pub const FRAME_INFO: &[FrameInfo] = &[
+        FrameInfo {
+            clip_size: 2,
+            shard_size: 2,
+            segment_size: 7,
+        }
+    ];
 
     pub fn model() -> Model { Model {
         vertices: Vec::from(VERTICES),
         segments: Vec::from(SEGMENTS),
-        segment_ranges: Vec::from(SEGMENT_INDEX_RANGES),
-        shards: vec![
-            Shard {
-                tex_bb: cgmath::Vector4::new(-1.0f32, -1.0f32, 1.0f32, 1.0f32),
-                color: cgmath::Vector4::new(1.0, 0.0, 0.0, 1.0),
-                clip_depth: 1,
-                tex_id: 0,
-                origin_index: 0,
-            },
-            Shard {
-                tex_bb: cgmath::Vector4::new(-0.2f32, 0.2f32, 1.3f32, 1.5f32),
-                color: cgmath::Vector4::new(0.0, 0.0, 1.0, 1.0),
-                clip_depth: 2,
-                tex_id: 1,
-                origin_index: 0,
-            },],
-        frames: vec![0..2],
+        shards: Vec::from(SHARDS),
+        frames: Vec::from(FRAMES),
     }}
 
     pub const MODEL_INFO: ModelInfo = ModelInfo {
         num_vertices: VERTICES.len(),
         num_segments: SEGMENTS.len(),
-        requested_quads: 15,
+        num_shards: SHARDS.len(),
+        num_frames: FRAMES.len(),
+        requested_frame_shards: 15,
+        requested_frame_segments: 20,
+        requested_scene_objects: 5,
     };
 }
