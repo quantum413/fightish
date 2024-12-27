@@ -62,6 +62,8 @@ impl RenderEngine {
             .create_bind_group_layout::<UniformGroup>(Some("Uniform bind group layout"));
         let frame_bind_group_layout = device
             .create_bind_group_layout::<FrameGroup>(Some("Frame bind group layout"));
+
+        // this is jank, but everything else you could do is also jank given the setup.
         let frame_read_bind_group_layout = device
             .device
             .create_bind_group_layout( &wgpu::BindGroupLayoutDescriptor {
@@ -80,6 +82,7 @@ impl RenderEngine {
                 ],
                 label: Some("Frame read bind group layout")
             });
+
         let model_bind_group_layout = device
             .create_bind_group_layout::<ModelGroup>(Some("Model bind group layout"));
         let scene_bind_group_layout = device

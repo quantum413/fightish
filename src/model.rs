@@ -5,8 +5,8 @@ use crate::scene::{SceneData};
 // ideally one wouldn't waste memory on having a cpu copy of the model.
 // so this is a simple stupid placeholder storage format
 pub struct Model {
-    pub vertices: Vec<Vertex>,
-    pub segments: Vec<Segment>,
+    pub vertices: Vec<ModelVertex>,
+    pub segments: Vec<ModelSegment>,
     pub shards: Vec<ModelShard>,
     pub frames: Vec<ModelFrame>,
 }
@@ -31,39 +31,40 @@ pub struct Uniforms {
 
 impl Uniforms {
     pub fn get(scene_data: &SceneData) -> Self {
-        let clip_frag_tf = // scaled -1 to +1 (clip coords)
-            cgmath::Matrix4::from_translation(cgmath::vec3(-1f32, 1f32, 0f32))
-                * // scaled from 0 to +2 for x and -2 to 0 for y
+        let frag_clip_tf = // frag coords scaled from vp_x/y to width + vp_x / height + vp_y;
+                cgmath::Matrix4::from_translation(cgmath::vec3(
+                    scene_data.vp_x as f32,
+                    scene_data.vp_y as f32,
+                    0f32,
+                ))
+            * // scaled from 0 to width/height
                 cgmath::Matrix4::from_nonuniform_scale(
-                    2f32 / scene_data.vp_width as f32,
-                    -2f32 / scene_data.vp_height as f32,
+                    scene_data.vp_width as f32 / 2.0,
+                    -(scene_data.vp_height as f32 / 2.0),
                     1f32,
                 )
-                * // scaled from 0 to width/height
-                cgmath::Matrix4::from_translation(cgmath::vec3(
-                    -scene_data.vp_x as f32,
-                    -scene_data.vp_y as f32,
-                    0f32,
-                )); // scaled from vp_x/y to width + vp_x / height + vp_y
+            * // scaled from 0 to +2 for x and -2 to 0 for y
+            cgmath::Matrix4::from_translation(cgmath::vec3(1f32, -1f32, 0f32))
+            ; // scaled -1 to +1 (clip coords)
 
         let world_clip_tf = scene_data.camera_tf;
 
         Self {
             clip_world_tf: world_clip_tf.invert().unwrap().into(),
-            frag_clip_tf: clip_frag_tf.invert().unwrap().into(),
+            frag_clip_tf: frag_clip_tf.into(),
         }
     }
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Vertex {
+pub struct ModelVertex {
     pos: [f32; 2]
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Segment {
+pub struct ModelSegment {
     pub idx: [i32; 4] // making this signed in case using negative values for special cases later
 }
 
@@ -104,21 +105,21 @@ pub struct FrameObject {
 pub mod check {
     use super::*;
 
-    pub const VERTICES: &[Vertex] = &[
-        Vertex { pos: [0.0, 0.0] },
-        Vertex { pos: [0.5, 1.0] },
-        Vertex { pos: [-0.5, 0.5] },
-        Vertex { pos: [0.0, -0.5] },
-        Vertex { pos: [0.2, 1.0] },
+    pub const VERTICES: &[ModelVertex] = &[
+        ModelVertex { pos: [0.0, 0.0] },
+        ModelVertex { pos: [0.5, 1.0] },
+        ModelVertex { pos: [-0.5, 0.5] },
+        ModelVertex { pos: [0.0, -0.5] },
+        ModelVertex { pos: [0.2, 1.0] },
     ];
-    pub const SEGMENTS: &[Segment] = &[
-        Segment { idx: [0, 2, -1, -1] },
-        Segment { idx: [2, 3, 0, -1] },
-        Segment { idx: [3, 1, -1, -1] },
-        Segment { idx: [1, 0, -1, -1] },
-        Segment { idx: [0, 1, -1, -1] },
-        Segment { idx: [1, 4, -1, -1] },
-        Segment { idx: [4, 0, -1, -1] },
+    pub const SEGMENTS: &[ModelSegment] = &[
+        ModelSegment { idx: [0, 2, -1, -1] },
+        ModelSegment { idx: [2, 3, 0, -1] },
+        ModelSegment { idx: [3, 1, -1, -1] },
+        ModelSegment { idx: [1, 0, -1, -1] },
+        ModelSegment { idx: [0, 1, -1, -1] },
+        ModelSegment { idx: [1, 4, -1, -1] },
+        ModelSegment { idx: [4, 0, -1, -1] },
     ];
     // pub const SEGMENT_INDEX_RANGES: &[Range<i32>] = &[0..4, 4..7];
     pub const SHARDS: &[ModelShard] = &[
