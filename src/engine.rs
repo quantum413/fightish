@@ -1,6 +1,8 @@
 use std::num::NonZeroU64;
 use anyhow::{anyhow, Result};
-use crate::model::*;
+use log::*;
+use crate::buffer_structs::*;
+use crate::model::check;
 use crate::render::{DeviceHandle, DeviceId, LayoutEnum, RenderContext, TargetTextureDongle};
 use crate::scene::{SceneData};
 
@@ -20,7 +22,11 @@ pub struct RenderEngine {
     world_uniforms_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
 
+    shard_vertex_frame_capacity: u64,
     shard_vertex_frame_buffer: wgpu::Buffer,
+    segment_frame_capacity: u64,
+    frame_bind_group_layout: wgpu::BindGroupLayout,
+    frame_read_bind_group_layout: wgpu::BindGroupLayout,
     segment_frame_buffer: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
     frame_read_bind_group: wgpu::BindGroup,
@@ -31,7 +37,9 @@ pub struct RenderEngine {
     frame_model_buffer: wgpu::Buffer,
     model_bind_group: wgpu::BindGroup,
 
+    object_scene_capacity: u64,
     object_scene_buffer: wgpu::Buffer,
+    scene_bind_group_layout: wgpu::BindGroupLayout,
     scene_bind_group: wgpu::BindGroup,
 }
 
@@ -180,10 +188,12 @@ impl RenderEngine {
                 }
             );
 
+        let segment_frame_capacity = 1u64;
+        let shard_vertex_frame_capacity = 1u64;
         let segment_frame_buffer = device
-            .create_buffer_with_layout_enum(&FrameGroup::Segment, info.requested_frame_segments as u64);
+            .create_buffer_with_layout_enum(&FrameGroup::Segment, segment_frame_capacity);
         let shard_vertex_frame_buffer = device
-            .create_buffer_with_layout_enum(&FrameGroup::ShardVertex, info.requested_frame_shards as u64 * 6);
+            .create_buffer_with_layout_enum(&FrameGroup::ShardVertex, shard_vertex_frame_capacity);
         let frame_bind_group = device
             .create_bind_group_with_enum_layout_map(
                 &frame_bind_group_layout,
@@ -223,8 +233,9 @@ impl RenderEngine {
                 }
             );
 
+        let object_scene_capacity = 1u64;
         let object_scene_buffer = device
-            .create_buffer_with_layout_enum(&SceneGroup::Object, info.requested_scene_objects as u64);
+            .create_buffer_with_layout_enum(&SceneGroup::Object, object_scene_capacity);
         let scene_bind_group = device
             .create_bind_group_with_enum_layout_map(
                 &scene_bind_group_layout,
@@ -279,8 +290,12 @@ impl RenderEngine {
             world_uniforms_buffer,
             uniform_bind_group,
 
+            shard_vertex_frame_capacity,
+            segment_frame_capacity,
             shard_vertex_frame_buffer,
             segment_frame_buffer,
+            frame_bind_group_layout,
+            frame_read_bind_group_layout,
             frame_bind_group,
             frame_read_bind_group,
 
@@ -290,19 +305,43 @@ impl RenderEngine {
             frame_model_buffer,
             model_bind_group,
 
+            object_scene_capacity,
             object_scene_buffer,
+            scene_bind_group_layout,
             scene_bind_group,
         }
     }
-    pub fn render(&self, device: &DeviceHandle,
+    pub fn render(&mut self, device: &DeviceHandle,
                          target_surface_view: &wgpu::TextureView,
                          target_texture_views: &Vec<wgpu::TextureView>,
                          scene_data: &SceneData,
     ) -> Result<()> {
-        let info = check::MODEL_INFO;
         let frame_info = check::FRAME_INFO;
-        if scene_data.objects.len() > info.requested_scene_objects {
-            return Err(anyhow!("Number of objects exceeds buffer size."));
+        if scene_data.objects.len() as u64 > self.object_scene_capacity {
+            let old_capacity = self.object_scene_capacity;
+            while self.object_scene_capacity < scene_data.objects.len() as u64 {
+                self.object_scene_capacity *= 2;
+            }
+            info!(
+                "Scene objects {} exceeds buffer capacity {}, resizing to capacity {}.",
+                scene_data.objects.len(),
+                old_capacity,
+                self.object_scene_capacity,
+            );
+            self.object_scene_buffer.destroy();
+            self.object_scene_buffer = device
+                .create_buffer_with_layout_enum(
+                    &SceneGroup::Object,
+                    self.object_scene_capacity
+                );
+            self.scene_bind_group = device
+                .create_bind_group_with_enum_layout_map(
+                    &self.scene_bind_group_layout,
+                    Some("Scene bind group"),
+                    |t| match t {
+                        SceneGroup::Object => self.object_scene_buffer.as_entire_binding(),
+                    }
+                );
         }
         let shard_extent: u32 = scene_data
             .objects
@@ -313,14 +352,68 @@ impl RenderEngine {
         let segment_extent: u32 = scene_data
             .objects
             .iter()
-            .map(|o| check::FRAME_INFO[o.frame_index as usize].shard_size)
+            .map(|o| check::FRAME_INFO[o.frame_index as usize].segment_size)
             .sum();
 
-        if shard_extent > info.requested_frame_shards as u32 {
-            return Err(anyhow!("Number of frame shards exceeds buffer size."));
+        let mut frame_bind_group_dirty = false;
+        let shard_vertex_extent = shard_extent as u64 * 6;
+        if shard_vertex_extent > self.shard_vertex_frame_capacity {
+            frame_bind_group_dirty = true;
+            let old_capacity = self.shard_vertex_frame_capacity;
+            while self.shard_vertex_frame_capacity < shard_vertex_extent {
+                self.shard_vertex_frame_capacity *= 2;
+            }
+            info!(
+                "Frame shard vertices requested {} exceeds capacity {}, resizing buffer to capacity {}.",
+                shard_vertex_extent,
+                old_capacity,
+                self.shard_vertex_frame_capacity,
+            );
+            self.shard_vertex_frame_buffer.destroy();
+            self.shard_vertex_frame_buffer = device
+                .create_buffer_with_layout_enum(
+                    &FrameGroup::ShardVertex,
+                    self.shard_vertex_frame_capacity
+                );
         }
-        if segment_extent > info.requested_frame_segments as u32 {
-            return Err(anyhow!("Number of frame segments exceeds buffer size."));
+        if segment_extent as u64 > self.segment_frame_capacity {
+            frame_bind_group_dirty = true;
+            let old_capacity = self.segment_frame_capacity;
+            while self.segment_frame_capacity < segment_extent as u64 {
+                self.segment_frame_capacity *= 2;
+            }
+            info!(
+                "Frame segments requested {} exceeds capacity {}, resizing buffer to capacity {}.",
+                segment_extent,
+                old_capacity,
+                self.segment_frame_capacity,
+            );
+            self.segment_frame_buffer.destroy();
+            self.segment_frame_buffer = device
+                .create_buffer_with_layout_enum(
+                    &FrameGroup::Segment,
+                    self.segment_frame_capacity);
+        }
+        if frame_bind_group_dirty {
+            info!("Rebuilding dirty bind groups.");
+            self.frame_bind_group = device
+                .create_bind_group_with_enum_layout_map(
+                    &self.frame_bind_group_layout,
+                    Some("Frame bind group"),
+                    |t| match t {
+                        FrameGroup::Segment => self.segment_frame_buffer.as_entire_binding(),
+                        FrameGroup::ShardVertex => self.shard_vertex_frame_buffer.as_entire_binding(),
+                    }
+                );
+            self.frame_read_bind_group = device
+                .create_bind_group_with_enum_layout_map(
+                    &self.frame_read_bind_group_layout,
+                    Some("Frame read bind group"),
+                    |t| match t {
+                        FrameGroup::Segment => self.segment_frame_buffer.as_entire_binding(),
+                        FrameGroup::ShardVertex => self.shard_vertex_frame_buffer.as_entire_binding(),
+                    }
+                );
         }
 
         let mut encoder = device

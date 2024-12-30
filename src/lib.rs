@@ -6,10 +6,13 @@ use winit::event_loop::ActiveEventLoop;
 use winit::event::{KeyEvent, WindowEvent};
 use log::{info, warn};
 
+use cgmath::SquareMatrix;
+
 mod scene;
 mod render;
 mod engine;
 mod model;
+mod buffer_structs;
 
 use scene::SceneData;
 use render::{
@@ -56,7 +59,7 @@ impl AppState {
 
             objects: vec![
                 scene::Object{world_local_tf: object_tf, frame_index: 0},
-                scene::Object{world_local_tf: cgmath::SquareMatrix::identity(), frame_index: 0},
+                scene::Object{world_local_tf: object_tf.invert().unwrap(), frame_index: 0},
             ]
         }
     }
@@ -116,7 +119,7 @@ impl App<'_> {
             let output = target.surface().get_current_texture()?;
             let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-            self.engine.as_ref().ok_or(anyhow!("Cannot render: engine missing."))?.render(
+            self.engine.as_mut().ok_or(anyhow!("Cannot render: engine missing."))?.render(
                 target.device(&self.context),
                 &view,
                 &target.texture_views(),
