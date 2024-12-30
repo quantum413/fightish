@@ -139,7 +139,8 @@ impl ApplicationHandler for App<'_> {
         assert!(self.target.is_none(), "Suspending and resuming are not supported.");
         let window = event_loop.create_window(Window::default_attributes()).unwrap();
         let target = pollster::block_on(RenderTarget::create(&mut self.context, Arc::new(window), RenderDongle::new())).unwrap();
-        self.engine = Some(RenderEngine::new(&self.context, target.device_id(), target.surface_format()));
+        let loader = model::SimpleLoader::new(model::check::model());
+        self.engine = Some(RenderEngine::new(&self.context, target.device_id(), target.surface_format(), loader));
         self.target = Some(target);
     }
 
