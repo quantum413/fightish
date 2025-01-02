@@ -59,7 +59,7 @@ impl AppState {
 
             objects: vec![
                 scene::Object{world_local_tf: object_tf, frame_index: 0},
-                scene::Object{world_local_tf: object_tf.invert().unwrap(), frame_index: 0},
+                scene::Object{world_local_tf: object_tf.invert().unwrap(), frame_index: 1},
             ]
         }
     }
@@ -89,6 +89,14 @@ impl AppState {
         }
     }
 }
+
+// struct InputState {
+//     key_states: [bool; Self::NUM_BINDINGS],
+// }
+//
+// impl InputState {
+//     const NUM_BINDINGS: usize = 8;
+// }
 
 #[derive(Debug)]
 pub struct App<'s> {
@@ -139,7 +147,7 @@ impl ApplicationHandler for App<'_> {
         assert!(self.target.is_none(), "Suspending and resuming are not supported.");
         let window = event_loop.create_window(Window::default_attributes()).unwrap();
         let target = pollster::block_on(RenderTarget::create(&mut self.context, Arc::new(window), RenderDongle::new())).unwrap();
-        let loader = model::SimpleLoader::new(model::check::model());
+        let loader = model::SimpleLoader::new(model::make_load_test(2, 2..5, 3..5));
         self.engine = Some(RenderEngine::new(&self.context, target.device_id(), target.surface_format(), loader));
         self.target = Some(target);
     }

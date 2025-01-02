@@ -1,5 +1,8 @@
+use std::iter;
 use crate::buffer_structs::{FrameInfo, ModelFrame, ModelGroup, ModelSegment, ModelShard, ModelVertex};
 use crate::render::{DeviceHandle, LayoutEnum};
+use rand::prelude::*;
+use log::*;
 
 // ideally one wouldn't waste memory on having a cpu copy of the model.
 // so this is a simple stupid placeholder storage format
@@ -33,7 +36,13 @@ impl SimpleLoader {
                     segment_size: (f.segment_range[1] - f.segment_range[0]) as u32,
                 }
             }).collect();
-
+        info!(
+            "Model information:\n# Frames: {}\n# Shards: {}\n# Segments: {}\n# Vertices: {}",
+            model.frames.len(),
+            model.shards.len(),
+            model.segments.len(),
+            model.vertices.len(),
+        );
         Self {
             model,
             frame_info,
@@ -111,7 +120,6 @@ impl SimpleLoader {
 }
 
 pub mod check {
-    use crate::buffer_structs::FrameInfo;
     use super::*;
 
     pub const VERTICES: &[ModelVertex] = &[
@@ -154,18 +162,104 @@ pub mod check {
         }
     ];
 
-    pub const FRAME_INFO: &[FrameInfo] = &[
-        FrameInfo {
-            clip_size: 2,
-            shard_size: 2,
-            segment_size: 7,
-        }
-    ];
-
     pub fn model() -> Model { Model {
         vertices: Vec::from(VERTICES),
         segments: Vec::from(SEGMENTS),
         shards: Vec::from(SHARDS),
         frames: Vec::from(FRAMES),
     }}
+}
+
+pub fn make_load_test(
+    num_frames: u32,
+    num_frame_shards: std::ops::Range<u32>,
+    num_shard_segments: std::ops::Range<u32>,
+) -> Model {
+    let mut rng = StdRng::from_seed(b"hflkajafdsahlvbsdfhqueesaydailay".clone());
+    let mut vertices:  Vec<ModelVertex> = Vec::new();
+    let mut segments: Vec<ModelSegment> = Vec::new();
+    let mut shards: Vec<ModelShard> = Vec::new();
+    let mut frames: Vec<ModelFrame> = Vec::new();
+
+    // let mut frame_segment_offset: i32 = 0;
+    // let mut frame_shard_offset: i32 = 0;
+    for frame in 0..num_frames {
+        let frame_segment_offset = segments.len() as i32;
+        let frame_shard_offset = shards.len() as i32;
+        let num_shards = rng.gen_range(num_frame_shards.clone());
+        info!("num shards for frame {}: {}", frame, num_shards);
+        for shard in 0..num_shards {
+            let shard_segment_offset = segments.len() as i32;
+            let num_segments = rng.gen_range(num_shard_segments.clone());
+            info!("num segments for shard {} in frame {} : {}", shard, frame, num_segments);
+            if num_segments == 0 {
+                shards.push(ModelShard{
+                    bb: [0., 0., 0., 0.],
+                    color: [0., 0., 0., 1.],
+                    segment_range: [shard_segment_offset, shard_segment_offset],
+                    clip_depth: shard,
+                    filler: 0,
+                });
+                continue;
+            }
+            let mut control_vertices: Vec<ModelVertex> = (0..num_segments)
+                .map(|_| ModelVertex {
+                    pos: [rng.gen::<f32>() - 0.5, rng.gen::<f32>() - 0.5],
+                })
+                .collect();
+            let mut corner_vertices: Vec<ModelVertex> = (0..(num_segments as usize - 1))
+                .map(|i| ModelVertex{
+                    pos: [
+                        (control_vertices[i].pos[0] + control_vertices[i + 1].pos[0]) / 2.,
+                        (control_vertices[i].pos[1] + control_vertices[i + 1].pos[1]) / 2.,
+                    ]
+                })
+                .chain(iter::once(ModelVertex{
+                    pos: [
+                        (control_vertices[0].pos[0] + control_vertices[num_segments as usize - 1].pos[0]) / 2.,
+                        (control_vertices[0].pos[1] + control_vertices[num_segments as usize - 1].pos[1]) / 2.,
+                    ]
+                }))
+                .collect();
+            let vertex_offset = vertices.len() as i32;
+            vertices.append(&mut control_vertices);
+            let corner_offset = vertices.len() as i32;
+            vertices.append(&mut corner_vertices);
+            let mut shard_segments : Vec<_> = iter::once(ModelSegment {
+                    idx: [
+                        corner_offset + num_segments as i32 - 1,
+                        corner_offset,
+                        vertex_offset,
+                        -1,
+                    ]
+                })
+                .chain((1..num_segments as i32).map(|i| ModelSegment {
+                    idx: [
+                        corner_offset + i - 1,
+                        corner_offset + i,
+                        vertex_offset + i,
+                        -1,
+                    ]
+                }))
+                .collect();
+            segments.append(&mut shard_segments);
+            shards.push(ModelShard {
+                bb: [-0.5, -0.5, 0.5, 0.5],
+                color: [rng.gen(), rng.gen(), rng.gen(), 1.0],
+                segment_range: [shard_segment_offset, segments.len() as i32],
+                clip_depth: shard,
+                filler: 0,
+            })
+        }
+        frames.push(ModelFrame {
+            shard_range: [frame_shard_offset, shards.len() as i32],
+            segment_range: [frame_segment_offset, segments.len() as i32],
+        });
+    }
+    Model {
+        vertices,
+        segments,
+        shards,
+        frames,
+    }
 }

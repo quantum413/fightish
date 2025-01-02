@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use cgmath::SquareMatrix;
 use log::*;
 use crate::buffer_structs::*;
-use crate::model::{check, SimpleLoader};
+use crate::model::SimpleLoader;
 use crate::render::{DeviceHandle, DeviceId, LayoutEnum, RenderContext, TargetTextureDongle};
 use crate::scene::SceneData;
 
@@ -280,13 +280,13 @@ impl RenderEngine {
         let shard_extent: u32 = scene_data
             .objects
             .iter()
-            .map(|o| check::FRAME_INFO[o.frame_index as usize].shard_size)
+            .map(|o| frame_info[o.frame_index as usize].shard_size)
             .sum();
 
         let segment_extent: u32 = scene_data
             .objects
             .iter()
-            .map(|o| check::FRAME_INFO[o.frame_index as usize].segment_size)
+            .map(|o| frame_info[o.frame_index as usize].segment_size)
             .sum();
 
         let model_group = self.loader.bind_group().unwrap();
